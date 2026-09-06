@@ -21,6 +21,9 @@ store = { path = "../store" }
 crypto = { path = "../crypto" }
 primary = { path = "../primary" }
 worker = { path = "../worker" }
+network = { path = "../network" }
+adaptive = { path = "../adaptive" }
+serde_json = "1.0"
 #hotstuff = { path = "../hotstuff" }
 #sailfish = { path = "../sailfish" }
 

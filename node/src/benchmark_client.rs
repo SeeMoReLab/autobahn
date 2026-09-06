@@ -1,40 +1,33 @@
-// Copyright(C) Facebook, Inc. and its affiliates.
+use adaptive::client::{run_client, ClientConfig, TargetMode};
 use anyhow::{Context, Result};
-use bytes::BufMut as _;
-use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
-use env_logger::Env;
-use futures::future::join_all;
-use futures::sink::SinkExt as _;
-use log::{info, warn};
-use rand::Rng;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tokio::time::{interval, sleep, Duration, Instant};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Benchmark client for Sailfish.")
-        .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
+        .about("Benchmark client: submits transactions to every worker, tracks commit acks, and prints per-interval Monitor lines.")
+        .args_from_usage("--targets=<ADDR>... 'Worker transaction endpoints, one per replica'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
-        .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
-        .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
+        .args_from_usage("--rate=<INT> 'The total rate (txs/s), split across targets'")
+        .args_from_usage("--request-timeout=<INT> 'Unacked transactions count as errors after this many ms'")
+        .args_from_usage("--target-mode=[MODE] 'spread: split rate across all replicas (default); leader: send everything to the current leader, following leader hints'")
+        .args_from_usage("--connections-per-target=[INT] 'Parallel connections (independent senders) per replica (default 4)'")
+        .args_from_usage("--monitor-interval=[INT] 'Milliseconds between Monitor lines (default 1000)'")
+        .args_from_usage("--start-unix-ms=[INT] 'Epoch ms at which to start submitting'")
+        .args_from_usage("--duration=[INT] 'How many seconds to run (default: until SIGINT)'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
 
-    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
-
-    let target = matches
-        .value_of("ADDR")
+    let targets = matches
+        .values_of("targets")
         .unwrap()
-        .parse::<SocketAddr>()
-        .context("Invalid socket address format")?;
-    let size = matches
+        .map(|x| x.parse::<SocketAddr>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Invalid target address")?;
+    let tx_size = matches
         .value_of("size")
         .unwrap()
         .parse::<usize>()
@@ -44,116 +37,46 @@ async fn main() -> Result<()> {
         .unwrap()
         .parse::<u64>()
         .context("The rate of transactions must be a non-negative integer")?;
-    let nodes = matches
-        .values_of("nodes")
-        .unwrap_or_default()
-        .into_iter()
-        .map(|x| x.parse::<SocketAddr>())
-        .collect::<Result<Vec<_>, _>>()
-        .context("Invalid socket address format")?;
+    let request_timeout = matches
+        .value_of("request-timeout")
+        .unwrap()
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .context("The request timeout must be a non-negative integer (ms)")?;
+    let monitor_interval = matches
+        .value_of("monitor-interval")
+        .unwrap_or("1000")
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .context("The monitor interval must be a non-negative integer (ms)")?;
+    let start_unix_ms = matches
+        .value_of("start-unix-ms")
+        .map(|x| x.parse::<u64>())
+        .transpose()
+        .context("The start time must be epoch milliseconds")?;
+    let duration = matches
+        .value_of("duration")
+        .map(|x| x.parse::<u64>().map(Duration::from_secs))
+        .transpose()
+        .context("The duration must be a non-negative integer (seconds)")?;
+    let target_mode = TargetMode::parse(matches.value_of("target-mode").unwrap_or("spread"))
+        .map_err(anyhow::Error::msg)?;
+    let connections_per_target = matches
+        .value_of("connections-per-target")
+        .unwrap_or("4")
+        .parse::<usize>()
+        .context("The connections per target must be a positive integer")?;
 
-    info!("Node address: {}", target);
-
-    // NOTE: This log entry is used to compute performance.
-    info!("Transactions size: {} B", size);
-
-    // NOTE: This log entry is used to compute performance.
-    info!("Transactions rate: {} tx/s", rate);
-
-    let client = Client {
-        target,
-        size,
+    run_client(ClientConfig {
+        targets,
+        target_mode,
+        connections_per_target,
         rate,
-        nodes,
-    };
-
-    // Wait for all nodes to be online and synchronized.
-    client.wait().await;
-
-    // Start the benchmark.
-    client.send().await.context("Failed to submit transactions")
-}
-
-struct Client {
-    target: SocketAddr,  //specifies the worker to connect to
-    size: usize,         //specifies the bit size of transactions
-    rate: u64,
-    nodes: Vec<SocketAddr>,  //specifies the addresses of all nodes. Currently only used to wait for them to be alive, but also necessary if we wanted to receive result replies (from any node).
-}
-
-impl Client {
-    pub async fn send(&self) -> Result<()> {
-        const PRECISION: u64 = 20; // Sample precision.
-        const BURST_DURATION: u64 = 1000 / PRECISION;
-
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
-        if self.size < 9 {
-            return Err(anyhow::Error::msg(
-                "Transaction size must be at least 9 bytes",
-            ));
-        }
-
-        // Connect to the mempool.
-        let stream = TcpStream::connect(self.target)
-            .await
-            .context(format!("failed to connect to {}", self.target))?;
-
-        // Submit all transactions.
-        let burst = self.rate / PRECISION;
-        let mut tx = BytesMut::with_capacity(self.size);
-        let mut counter = 0;
-        let mut r = rand::thread_rng().gen();
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
-        let interval = interval(Duration::from_millis(BURST_DURATION));
-        tokio::pin!(interval);
-
-        // NOTE: This log entry is used to compute performance.
-        info!("Start sending transactions");
-
-        'main: loop {
-            interval.as_mut().tick().await;
-            let now = Instant::now();
-
-            for x in 0..burst {
-                if x == counter % burst {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
-
-                    tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
-                } else {
-                    r += 1;
-                    tx.put_u8(1u8); // Standard txs start with 1.
-                    tx.put_u64(r); // Ensures all clients send different txs.
-                };
-
-                tx.resize(self.size, 0u8); //Truncate any bits past size
-                let bytes = tx.split().freeze(); //split() moves byte content from tx to bytes (i.e. avoids copy). freeze() makes it const so it can be shared. (bytes can now be used/sent async)
-                //Note: Does not sign transactions. Transaction id-s are not unique w.r.t to content.
-                if let Err(e) = transport.send(bytes).await { //Uses TCP connection to send request to assigned worker. Note: Optimistically only sending to one worker.
-                    warn!("Failed to send transaction: {}", e);
-                    break 'main;
-                }
-            }
-            if now.elapsed().as_millis() > BURST_DURATION as u128 {
-                // NOTE: This log entry is used to compute performance.
-                warn!("Transaction rate too high for this client");
-            }
-            counter += 1;
-        }
-        Ok(())
-    }
-
-    pub async fn wait(&self) {
-        // Wait for all nodes to be online.
-        info!("Waiting for all nodes to be online...");
-        join_all(self.nodes.iter().cloned().map(|address| {
-            tokio::spawn(async move {
-                while TcpStream::connect(address).await.is_err() {
-                    sleep(Duration::from_millis(10)).await;
-                }
-            })
-        }))
-        .await;
-    }
+        tx_size,
+        request_timeout,
+        monitor_interval,
+        start_unix_ms,
+        duration,
+    })
+    .await
 }

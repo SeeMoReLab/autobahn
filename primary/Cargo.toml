@@ -23,6 +23,7 @@ async-trait = "0.1.50"
 crypto = { path = "../crypto" }
 store = { path = "../store" }
 config = { path = "../config" }
+adaptive = { path = "../adaptive" }
 network = { path = "../network" }
 #sailfish = { path = "../sailfish"}
 

@@ -61,6 +61,9 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Height),
+    /// The primary indicates these batches were committed by consensus, so
+    /// the worker can ack the client transactions they contain.
+    Committed(Vec<Digest>),
 }
 
 /// The messages sent by the workers to their primary.
@@ -73,6 +76,52 @@ pub enum WorkerPrimaryMessage {
 }
 
 pub struct Primary;
+
+/// Adaptive-timer instrumentation for the primary: runtime timeout knobs,
+/// learning-event recording, protocol failure injection, and the first-seen
+/// registry used to compute header commit latency in the application layer.
+/// Replica ids are the harness's global 0-based ids (see the failure spec).
+pub struct PrimaryInstrumentation {
+    pub timeout_delay: adaptive::timeouts::TimeoutCell,
+    pub fast_path_timeout: adaptive::timeouts::TimeoutCell,
+    /// Wired for contract uniformity; the current engine never arms a timer
+    /// from car_timeout.
+    pub car_timeout: adaptive::timeouts::TimeoutCell,
+    pub learning: Option<std::sync::Arc<adaptive::episode::LearningManager>>,
+    pub proposal_delay: std::sync::Arc<adaptive::failure::ProposalDelayController>,
+    pub first_seen:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Digest, std::time::Instant>>>,
+    pub replica_id: u32,
+    pub replica_of: std::collections::HashMap<PublicKey, u32>,
+}
+
+impl PrimaryInstrumentation {
+    /// No learning, no failure injection; timeout cells fixed at the
+    /// parameters' values.
+    pub fn disabled(parameters: &Parameters) -> Self {
+        use std::time::Duration;
+        Self {
+            timeout_delay: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
+                parameters.timeout_delay,
+            )),
+            fast_path_timeout: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
+                parameters.fast_path_timeout,
+            )),
+            car_timeout: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
+                parameters.car_timeout,
+            )),
+            learning: None,
+            proposal_delay: std::sync::Arc::new(
+                adaptive::failure::ProposalDelayController::disabled(),
+            ),
+            first_seen: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            replica_id: 0,
+            replica_of: std::collections::HashMap::new(),
+        }
+    }
+}
 
 impl Primary {
     pub fn spawn(
@@ -89,6 +138,7 @@ impl Primary {
         _rx_pushdown_cert: Receiver<Certificate>,
         rx_request_header_sync: Receiver<Digest>,
         tx_output: Sender<Header>,
+        instrumentation: PrimaryInstrumentation,
     ) {
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
@@ -177,6 +227,11 @@ impl Primary {
         // use_ride_share: bool,
         // car_timeout: u64,
 
+        // Clones for the proposer, extracted before the instrumentation moves
+        // into the core.
+        let proposal_delay_for_proposer = std::sync::Arc::clone(&instrumentation.proposal_delay);
+        let proposer_replica_id = instrumentation.replica_id;
+
         // The `Core` receives and handles headers, votes, and certificates from the other primaries.
         Core::spawn(
             name,
@@ -206,6 +261,7 @@ impl Primary {
             parameters.simulate_asynchrony,
             parameters.asynchrony_start,
             parameters.asynchrony_duration,
+            instrumentation,
         );
 
         Committer::spawn(committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);
@@ -259,6 +315,8 @@ impl Primary {
             /* rx_workers */ rx_our_digests,
             /* rx_ticket */ rx_instance,
             /* tx_core */ tx_headers,
+            proposal_delay_for_proposer,
+            proposer_replica_id,
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.

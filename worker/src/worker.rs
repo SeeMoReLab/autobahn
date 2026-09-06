@@ -7,6 +7,8 @@ use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
+use adaptive::ack::{AckIndex, AckRouter};
+use adaptive::front::ClientFront;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
@@ -17,8 +19,14 @@ use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
+
+/// Bound on batches sealed locally but not yet observed as committed. Beyond
+/// this, the oldest pending batches are dropped from the ack index and their
+/// transactions surface as client-side timeouts.
+const ACK_INDEX_CAPACITY: usize = 100_000;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -71,10 +79,31 @@ impl Worker {
             store,
         };
 
+        // Commit-ack plumbing between the client front and the benchmark
+        // client: the batch maker registers sealed batches in the index and
+        // the ack dispatcher acks them when the primary reports them
+        // committed.
+        let ack_index = Arc::new(AckIndex::new(ACK_INDEX_CAPACITY));
+        let ack_router = Arc::new(AckRouter::new());
+        let (tx_committed, mut rx_committed) = channel::<Vec<Digest>>(CHANNEL_CAPACITY);
+        {
+            let ack_index = Arc::clone(&ack_index);
+            let ack_router = Arc::clone(&ack_router);
+            tokio::spawn(async move {
+                while let Some(digests) = rx_committed.recv().await {
+                    for digest in digests {
+                        if let Some(txs) = ack_index.take(&digest.0) {
+                            ack_router.ack(&txs);
+                        }
+                    }
+                }
+            });
+        }
+
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();                         //spawns async task that listens for network message from Primary
-        worker.handle_clients_transactions(tx_primary.clone());   //spawns async task that listens for network messages from Client
+        worker.handle_primary_messages(tx_committed);             //spawns async task that listens for network message from Primary
+        worker.handle_clients_transactions(tx_primary.clone(), ack_index, ack_router); //spawns async task that listens for network messages from Client
         worker.handle_workers_messages(tx_primary);               //spawns async task that listens for network messages from other Workers
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
@@ -104,7 +133,7 @@ impl Worker {
 
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(&self, tx_committed: Sender<Vec<Digest>>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and Synchronizer
 
         // Receive incoming messages from our primary.
@@ -117,7 +146,7 @@ impl Worker {
         Receiver::spawn(
             address,                                    //socket to receive Primary messages from
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer }, //handler for received Primary messages, forwards them to synchronizer
+            PrimaryReceiverHandler { tx_synchronizer, tx_committed }, //handler for received Primary messages, forwards them to synchronizer or the ack dispatcher
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -140,22 +169,26 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
+    fn handle_clients_transactions(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,  //tx_primary: channel between processor and PrimaryConnector
+        ack_index: Arc<AckIndex>,
+        ack_router: Arc<AckRouter>,
+    ) {
+        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between ClientFront and batch maker
         //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
 
-        // We first receive clients' transactions from the network.
+        // We first receive clients' transactions from the network. The front
+        // tags each transaction with its connection so commit acks can flow
+        // back on the same socket.
         let mut address = self
             .committee
             .worker(&self.name, &self.id)
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
-            address,                                            //socket to receive Client messages from
-            /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
-        );
+        ClientFront::new(address, tx_batch_maker, ack_router).spawn();
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
@@ -163,7 +196,7 @@ impl Worker {
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
-            /* rx_transaction */ rx_batch_maker,  //receiver channel to connect to TxReceiverHandler 
+            /* rx_transaction */ rx_batch_maker,  //receiver channel to connect to ClientFront
             // tx_message tx_quorum_waiter,   //sender channel to connect to quorum waiter
            /* tx_batch */ tx_processor,  //sender channel to connect to processor
             /* workers_addresses */
@@ -172,6 +205,7 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
+            ack_index,
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -248,28 +282,6 @@ impl Worker {
 /////////////////////////// Network Handlers ///////////////////////////////
 
 
-/// Defines how the network receiver handles incoming transactions.
-//Note: Only expect to receive client messages submitting new transactions.
-#[derive(Clone)]
-struct TxReceiverHandler {
-    tx_batch_maker: Sender<Transaction>,  //sender channel to connect to batch maker
-}
-
-#[async_trait]
-impl MessageHandler for TxReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        // Send the transaction to the batch maker.
-        self.tx_batch_maker
-            .send(message.to_vec())
-            .await
-            .expect("Failed to send transaction");
-
-        // Give the change to schedule other tasks.
-        tokio::task::yield_now().await;
-        Ok(())
-    }
-}
-
 /// Defines how the network receiver handles incoming workers messages.
 //Note: Only expect to receive worker messages that are a) proposing batches, or b) acknowledging batches
 #[derive(Clone)]
@@ -310,6 +322,7 @@ impl MessageHandler for WorkerReceiverHandler {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,  //sender channel to connect to synchronizer.
+    tx_committed: Sender<Vec<Digest>>,              //sender channel to connect to the ack dispatcher.
 }
 
 #[async_trait]
@@ -319,10 +332,16 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        // Deserialize the message and send it to the synchronizer.
+        // Deserialize the message and send it to the synchronizer, except
+        // commit notifications, which go to the ack dispatcher.
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self             
+            Ok(PrimaryWorkerMessage::Committed(digests)) => self
+                .tx_committed
+                .send(digests)
+                .await
+                .expect("Failed to send committed digests"),
+            Ok(message) => self
                 .tx_synchronizer
                 .send(message)
                 .await

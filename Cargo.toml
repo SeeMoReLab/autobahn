@@ -1,2 +1,4 @@
 [workspace]
-members = ["primary", "node", "store", "crypto", "worker", "consensus", "network", "config", "hotstuff"]
+resolver = "2"
+members = ["primary", "node", "store", "crypto", "worker", "network", "config", "adaptive"]
+exclude = ["baselines", "consensus", "hotstuff", "sailfish"]

@@ -157,6 +157,11 @@ impl Synchronizer {
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
                         self.network.send(address, Bytes::from(serialized)).await;
                     },
+                    PrimaryWorkerMessage::Committed(_) => {
+                        // Routed to the ack dispatcher by the worker's
+                        // primary receiver handler; must not reach here.
+                        error!("Committed message unexpectedly routed to synchronizer");
+                    },
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
                         self.round = round;

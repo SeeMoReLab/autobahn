@@ -1,0 +1,22 @@
+[package]
+name = "adaptive"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+log = "0.4"
+chrono = "0.4"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0"
+
+[build-dependencies]
+tonic-build = "0.12"

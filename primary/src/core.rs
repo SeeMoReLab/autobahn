@@ -128,6 +128,9 @@ pub struct Core {
 
     use_ride_share: bool,
     car_timeout: u64,
+    instrumentation: crate::primary::PrimaryInstrumentation,
+    replica_ids: Vec<u32>,
+    commits_since_last_timeout: u64,
     car_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Vote> + Send>>>,
     fast_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ConsensusVote> + Send>>>, // Use this one for Fast Path on external Consensus case
 
@@ -172,7 +175,10 @@ impl Core {
         simulate_asynchrony: bool,
         asynchrony_start: u64,
         asynchrony_duration: u64,
+        instrumentation: crate::primary::PrimaryInstrumentation,
     ) {
+        let mut replica_ids: Vec<u32> = instrumentation.replica_of.values().copied().collect();
+        replica_ids.sort_unstable();
         tokio::spawn(async move {
             Self {
                 name,
@@ -239,10 +245,32 @@ impl Core {
                 async_timer_futures: FuturesUnordered::new(),
                 current_time: Instant::now(),
                 async_delayed_prepare: None,
+                instrumentation,
+                replica_ids,
+                commits_since_last_timeout: 0,
             }
             .run()
             .await;
         });
+    }
+
+    fn current_timeout_delay(&self) -> u64 {
+        self.instrumentation.timeout_delay.get().as_millis() as u64
+    }
+
+    fn current_fast_path_timeout(&self) -> u64 {
+        self.instrumentation.fast_path_timeout.get().as_millis() as u64
+    }
+
+    // Resolve the current consensus leader to a global replica id and keep
+    // the proposal-delay controller's leader window pinned.
+    fn observe_leader_for_injection(&self, slot: Slot, view: View) {
+        let leader = self.leader_elector.get_leader(slot, view);
+        if let Some(leader_id) = self.instrumentation.replica_of.get(&leader) {
+            self.instrumentation
+                .proposal_delay
+                .observe_leader(*leader_id, &self.replica_ids);
+        }
     }
 
     async fn process_own_header(&mut self, mut header: Header) -> DagResult<()> {
@@ -311,6 +339,17 @@ impl Core {
     async fn process_header(&mut self, header: Header, sync: bool) -> DagResult<()> {
         debug!("Processing Header:  {:?}", header);
         debug!("Processing the header with height {:?}", header.height);
+
+        // Track when we first processed this header, to compute commit
+        // latency in the application layer (which removes the entry).
+        if self.instrumentation.learning.is_some() {
+            self.instrumentation
+                .first_seen
+                .lock()
+                .unwrap()
+                .entry(header.id.clone())
+                .or_insert_with(std::time::Instant::now);
+        }
 
         // Check the parent certificate. Ensure the certificate contains a quorum of votes and is
         // at the preivous height
@@ -637,7 +676,7 @@ impl Core {
                         consensus_votes: vec![(*slot, digest.clone(), Signature::default())], 
                         //consensus_instance: Some(current_instance.clone()), //Buffer instance. Current header could've advanced in the meantime and thus no longer include this instance by the time timer triggers
                     };
-                    let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
+                    let fast_timer = CarTimer::new(t_vote, self.current_fast_path_timeout());
                     self.car_timer_futures.push(Box::pin(fast_timer));
                     //self.timers.insert((tc.slot, tc.view + 1));
                 }
@@ -738,7 +777,7 @@ impl Core {
                 consensus_votes: vec![], //Create dummy vote with no sigs => this indicates its the Car timeout
                 //consensus_instance: None
             };
-            let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
+            let fast_timer = CarTimer::new(t_vote, self.current_fast_path_timeout());
             self.car_timer_futures.push(Box::pin(fast_timer));
         }
 
@@ -815,7 +854,7 @@ impl Core {
                     //By including only the digest of the missing instance we avoid duplicates. 
                         //Alternatively could modify QCMaker such that it wipes the QC after first use
 
-                let fast_timer = FastTimer::new(vote.clone(), self.fast_path_timeout);
+                let fast_timer = FastTimer::new(vote.clone(), self.current_fast_path_timeout());
                 self.fast_timer_futures.push(Box::pin(fast_timer));
                 //self.timers.insert((tc.slot, tc.view + 1));
             }
@@ -1035,7 +1074,10 @@ impl Core {
 
                 if *slot + 1 > self.k {
                     debug!("beyond init k");
-                    if !self.committed_slots.contains_key(&(slot + 1 - self.k)) {
+                    if !(slot + 1)
+                        .checked_sub(self.k)
+                        .map_or(false, |s| self.committed_slots.contains_key(&s))
+                    {
                         debug!("too many instances open");
                         self.prepare_tickets.push_back(prepare_message.clone());
                         return Ok(())
@@ -1431,9 +1473,9 @@ impl Core {
                 // TODO:Can implement different forwarding methods (can be random, can forward to f+1, current one is the most pessimisstic)
               
                 if self.k > 1 { //check whether a) we have already committed; and if not b) whether ticket is ready (prepare and QC)
-                    if !self.committed_slots.contains_key(&(slot+1)) && !self.timers.contains(&(slot + 1, 1)) && self.committed_slots.contains_key(&(slot+1 - self.k))  { 
+                    if !self.committed_slots.contains_key(&(slot+1)) && !self.timers.contains(&(slot + 1, 1)) && (slot + 1).checked_sub(self.k).map_or(false, |s| self.committed_slots.contains_key(&s)) { 
                         debug!("start timer for slot {}", slot +1);
-                        let timer = Timer::new(slot + 1, 1, self.timeout_delay);
+                        let timer = Timer::new(slot + 1, 1, self.current_timeout_delay());
                         self.timer_futures.push(Box::pin(timer));
                         self.timers.insert((slot + 1, 1));
                     }
@@ -1542,6 +1584,7 @@ impl Core {
                 //update bounding heuristic
                 self.last_committed_slot = max(sl, self.last_committed_slot);
                 self.committed_slots.insert(sl, CommitQC::new(*slot, *view, qc.clone(), proposals.clone()).await);
+                self.commits_since_last_timeout += 1;
 
 
                 //self.begin_slot_from_commit(&commit_message).await.expect("Failed to start next consensus");
@@ -1549,7 +1592,7 @@ impl Core {
                 if self.k == 1 { //Start timer for next slot
                     if !self.timers.contains(&(slot + self.k, 1)) {
                         debug!("start timer for slot {}", slot +1);
-                        let timer = Timer::new(slot + self.k, 1, self.timeout_delay);
+                        let timer = Timer::new(slot + self.k, 1, self.current_timeout_delay());
                         self.timer_futures.push(Box::pin(timer));
                         self.timers.insert((slot + self.k, 1));
                     }
@@ -1557,7 +1600,7 @@ impl Core {
                 else{ //If slot + k has ticket ready (Prepare from s+k-1 + QC in s)
                     if !self.timers.contains(&(slot + self.k, 1)) && self.views.contains_key(&(slot+self.k -1)) {
                         debug!("start timer for slot {}", slot +1);
-                        let timer = Timer::new(slot + self.k, 1, self.timeout_delay);
+                        let timer = Timer::new(slot + self.k, 1, self.current_timeout_delay());
                         self.timer_futures.push(Box::pin(timer));
                         self.timers.insert((slot + self.k, 1));
                     }
@@ -1684,7 +1727,7 @@ impl Core {
         //If !ReadyFast, start a timer to continue here.
         //This timer calls QCMaker.get() which returns the ready QC with 2f+1
 
-        // let timer = Timer::new(tc.slot, tc.view + 1, self.timeout_delay);
+        // let timer = Timer::new(tc.slot, tc.view + 1, self.current_timeout_delay());
         // self.timer_futures.push(Box::pin(timer));
         // self.timers.insert((tc.slot, tc.view + 1));
 
@@ -1736,6 +1779,18 @@ impl Core {
             }
             None => {},
         };
+
+        // A genuine (non-obsolete) view-change timeout: record it for the
+        // learning window and keep the failure controller's leader window
+        // pinned to the leader we are timing out on.
+        if let Some(learning) = &self.instrumentation.learning {
+            learning.record_view_change();
+            if self.commits_since_last_timeout == 0 {
+                learning.record_no_progress_view_change();
+            }
+        }
+        self.commits_since_last_timeout = 0;
+        self.observe_leader_for_injection(slot, view);
 
         debug!("Sending Timeout for slot {}, view {}", slot, view);
         // Make a timeout message.for the slot, view, containing the highest QC this replica has
@@ -1820,7 +1875,8 @@ impl Core {
             self.views.insert(timeout.slot, timeout.view + 1);
 
             // Start the new view timer
-            let timer = Timer::new(tc.slot, tc.view + 1, self.timeout_delay);
+            self.observe_leader_for_injection(tc.slot, tc.view + 1);
+            let timer = Timer::new(tc.slot, tc.view + 1, self.current_timeout_delay());
             self.timer_futures.push(Box::pin(timer));
             self.timers.insert((tc.slot, tc.view + 1));
 
@@ -2038,7 +2094,7 @@ impl Core {
 
         // Start the timeout for slot 1, view 1
         debug!("start timer for slot {}", 1);
-        let first_timer = Timer::new(1, 1, self.timeout_delay);
+        let first_timer = Timer::new(1, 1, self.current_timeout_delay());
         self.timer_futures.push(Box::pin(first_timer));
         self.timers.insert((1, 1));
         self.views.insert(1, 1);

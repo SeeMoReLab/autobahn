@@ -4,6 +4,9 @@ use std::collections::{HashMap, BTreeMap};
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header, ConsensusMessage};
 use crate::primary::Height;
+use adaptive::failure::ProposalDelayController;
+use log::warn;
+use std::sync::Arc;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService, Hash};
 use log::debug;
@@ -52,6 +55,11 @@ pub struct Proposer {
     num_active_instances: usize, 
     use_special_rule: bool, 
     is_special: bool,
+    /// Protocol failure injection: delays this replica's header proposals
+    /// when the failure spec targets it (the core keeps the leader window
+    /// pinned).
+    proposal_delay: Arc<ProposalDelayController>,
+    replica_id: u32,
 }
 
 impl Proposer {
@@ -66,6 +74,8 @@ impl Proposer {
         rx_workers: Receiver<(Digest, WorkerId)>,
         rx_instance: Receiver<ConsensusMessage>,
         tx_core: Sender<Header>,
+        proposal_delay: Arc<ProposalDelayController>,
+        replica_id: u32,
     ) {
         /*let genesis: Vec<Digest> = Certificate::genesis(&committee)
             .iter()
@@ -94,6 +104,8 @@ impl Proposer {
                 num_active_instances: 0,
                 use_special_rule: false,
                 is_special: false,
+                proposal_delay,
+                replica_id,
             }
             .run()
             .await;
@@ -101,6 +113,19 @@ impl Proposer {
     }
     
     async fn make_header(&mut self) {
+        // Protocol failure injection: a targeted replica delays its header
+        // (car) proposals. Sleeping here intentionally stalls this
+        // replica's proposal pipeline, which is the point of the fault.
+        let injected_delay = self.proposal_delay.delay_for(self.replica_id);
+        if injected_delay > Duration::ZERO {
+            warn!(
+                "Injecting proposal delay of {} ms at height {}",
+                injected_delay.as_millis(),
+                self.height
+            );
+            sleep(injected_delay).await;
+        }
+
         // Make a new header.
         debug!("digests size before is {:?}", self.digests.len());
         /*let mut header: Header;

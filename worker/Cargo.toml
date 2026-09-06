@@ -20,6 +20,7 @@ store = { path = "../store" }
 config = { path = "../config" }
 network = { path = "../network" }
 primary = { path = "../primary" }
+adaptive = { path = "../adaptive" }
 
 [dev-dependencies]
 rand = "0.7.3"

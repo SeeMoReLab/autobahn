@@ -1,0 +1,315 @@
+syntax = "proto3";
+
+option go_package = "github.com/tendermint/tendermint/proto/adaptive_timers;adaptivetimers";
+
+import "google/protobuf/empty.proto";
+
+enum Protocol {
+    reserved 2;
+    PROTOCOL_UNSPECIFIED = 0;
+    PROTOCOL_PBFT = 1;
+    PROTOCOL_SBFT = 3;
+    PROTOCOL_TENDERMINT = 4;
+    PROTOCOL_HOTSTUFF = 5;
+    PROTOCOL_AUTOBAHN = 6;
+}
+
+// PBFT-specific state report.
+message PbftReport {
+    // Workload size in the learning window.
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+
+    // End-to-end PBFT consensus latency summaries (milliseconds).
+    float avg_consensus_latency_ms = 3;
+    float p50_consensus_latency_ms = 4;
+    float p95_consensus_latency_ms = 5;
+
+    // Throughput.
+    float throughput_tps = 6;
+
+    // Batch characteristics.
+    float avg_batch_size = 7;
+    float p95_batch_size = 8;
+
+    // Leadership dynamics.
+    uint32 leader_change_count = 9;
+    uint32 regency_change_count = 10;
+
+    // Timer and liveness context for the same learning window.
+    uint32 timeout_ms = 11;
+    float avg_inter_commit_gap_ms = 12;
+    float p50_inter_commit_gap_ms = 13;
+    float p95_inter_commit_gap_ms = 14;
+    uint32 view_change_count = 15;
+    uint32 no_progress_view_change_count = 16;
+}
+
+// SBFT-specific state report.
+// For now this mirrors PBFT metrics up to leadership dynamics.
+message SbftReport {
+    // Workload size in the learning window.
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+
+    // End-to-end SBFT consensus latency summaries (milliseconds).
+    float avg_consensus_latency_ms = 3;
+    float p95_consensus_latency_ms = 4;
+    float p99_consensus_latency_ms = 5;
+
+    // Throughput and core rates.
+    float throughput_tps = 6;
+    float timeout_violation_rate = 7;
+
+    // Batch characteristics.
+    float avg_batch_size = 8;
+    float p95_batch_size = 9;
+
+    // Leadership dynamics.
+    uint32 leader_change_count = 10;
+    uint32 regency_change_count = 11;
+}
+
+message TendermintReport {
+    // Workload size in the learning window.
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+
+    // End-to-end Tendermint consensus latency summaries (milliseconds).
+    float avg_consensus_latency_ms = 3;
+    float p50_consensus_latency_ms = 4;
+    float p90_consensus_latency_ms = 5;
+
+    // Throughput and core rates.
+    float throughput_tps = 6;
+    float timeout_violation_rate = 7;
+
+    // Batch characteristics.
+    float avg_batch_size = 8;
+    float p50_batch_size = 9;
+    float p90_batch_size = 15;
+
+    // Leadership dynamics.
+    uint32 leader_change_count = 10;
+    uint32 regency_change_count = 11;
+
+    // Phase-wise latency
+    float propose_latency_ms = 12;
+    float prevote_latency_ms = 13;
+    float precommit_latency_ms = 14;
+}
+
+// Batched (chained 2-chain) HotStuff state report. Field layout mirrors
+// PbftReport so tooling can treat the two uniformly; semantic notes:
+// - view_change_count counts local round timeouts fired.
+// - no_progress_view_change_count counts timeouts fired with no commit since
+//   the previous timeout.
+// - regency_change_count counts observed round-number jumps beyond +1
+//   between consecutive commits (i.e. rounds skipped via TCs).
+// - leader_change_count follows the committed blocks' authors; HotStuff
+//   rotates leaders every round, so this tracks commit cadence, not
+//   elections.
+message HotstuffReport {
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+    float avg_consensus_latency_ms = 3;
+    float p50_consensus_latency_ms = 4;
+    float p95_consensus_latency_ms = 5;
+    float throughput_tps = 6;
+    float avg_batch_size = 7;
+    float p95_batch_size = 8;
+    uint32 leader_change_count = 9;
+    uint32 regency_change_count = 10;
+    uint32 timeout_ms = 11;
+    float avg_inter_commit_gap_ms = 12;
+    float p50_inter_commit_gap_ms = 13;
+    float p95_inter_commit_gap_ms = 14;
+    uint32 view_change_count = 15;
+    uint32 no_progress_view_change_count = 16;
+}
+
+// Autobahn state report. Same layout and semantics as HotstuffReport, with
+// batch sizes measured in payload digests per committed header (transaction
+// counts live in the worker processes, not the primary).
+message AutobahnReport {
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+    float avg_consensus_latency_ms = 3;
+    float p50_consensus_latency_ms = 4;
+    float p95_consensus_latency_ms = 5;
+    float throughput_tps = 6;
+    float avg_batch_size = 7;
+    float p95_batch_size = 8;
+    uint32 leader_change_count = 9;
+    uint32 regency_change_count = 10;
+    uint32 timeout_ms = 11;
+    float avg_inter_commit_gap_ms = 12;
+    float p50_inter_commit_gap_ms = 13;
+    float p95_inter_commit_gap_ms = 14;
+    uint32 view_change_count = 15;
+    uint32 no_progress_view_change_count = 16;
+}
+
+// One report from a local node for one episode.
+message ReportLocal {
+    reserved 11;
+    uint32 node_id = 1;
+    uint32 episode = 2;
+    Protocol protocol = 3;
+    // Window start consensus tick used to build this report.
+    uint32 start_tick = 6;
+    // Window end consensus tick (exclusive) used to build this report.
+    uint32 report_seq = 7;
+    // Number of locally delivered consensus instances in this window.
+    // PBFT uses zero to identify a wall-clock-bounded window; the actual
+    // delivered count remains in PbftReport.total_consensus_instances.
+    uint32 window_consensus_count = 8;
+    oneof state {
+        PbftReport pbft_state = 10;
+        SbftReport sbft_state = 12;
+        TendermintReport tendermint_state = 13;
+        HotstuffReport hotstuff_state = 14;
+        AutobahnReport autobahn_state = 15;
+    }
+    optional Reward reward = 4;
+    bytes signature = 5;
+}
+
+// PBFT action/reward feedback.
+message PbftReward {
+    uint32 episode = 1;
+    PbftReport report = 2;
+    PbftTimeout timeout_used = 3;
+}
+
+// SBFT action/reward feedback.
+message SbftReward {
+    uint32 episode = 1;
+    SbftReport report = 2;
+    SbftTimeout timeout_used = 3;
+}
+
+// Tendermint action/reward feedback.
+message TendermintReward {
+    uint32 episode = 1;
+    TendermintReport report = 2;
+    TendermintTimeout timeout_used = 3;
+}
+
+// HotStuff action/reward feedback.
+message HotstuffReward {
+    uint32 episode = 1;
+    HotstuffReport report = 2;
+    HotstuffTimeout timeout_used = 3;
+}
+
+// Autobahn action/reward feedback.
+message AutobahnReward {
+    uint32 episode = 1;
+    AutobahnReport report = 2;
+    AutobahnTimeout timeout_used = 3;
+}
+
+// Reward for a prior episode, sent alongside the next report.
+message Reward {
+    reserved 2;
+    oneof value {
+        PbftReward pbft = 1;
+        SbftReward sbft = 3;
+        TendermintReward tendermint = 4;
+        HotstuffReward hotstuff = 5;
+        AutobahnReward autobahn = 6;
+    }
+}
+
+// Batch of signed reports submitted for consensus
+message ReportBatch {
+    uint32 episode = 1;
+    Protocol protocol = 2;
+    repeated ReportLocal reports = 3;
+}
+
+message PbftTimeout {
+    uint32 election_timeout_milliseconds = 1;
+}
+
+message SbftTimeout {
+    uint32 election_timeout_milliseconds = 1;
+    uint32 slow_path_timeout_milliseconds = 2;
+    uint32 batch_timeout_milliseconds = 3;
+}
+
+message TendermintTimeout {
+    uint32 propose_timeout_milliseconds = 1;
+    uint32 prevote_timeout_milliseconds = 2;
+    uint32 precommit_timeout_milliseconds = 3;
+}
+
+message HotstuffTimeout {
+    uint32 timeout_delay_milliseconds = 1;
+}
+
+message AutobahnTimeout {
+    uint32 timeout_delay_milliseconds = 1;
+    uint32 car_timeout_milliseconds = 2;
+    uint32 fast_path_timeout_milliseconds = 3;
+}
+
+// Timeout recommendation.
+message Timeout {
+    reserved 2;
+    oneof value {
+        PbftTimeout pbft = 1;
+        SbftTimeout sbft = 3;
+        TendermintTimeout tendermint = 4;
+        HotstuffTimeout hotstuff = 5;
+        AutobahnTimeout autobahn = 6;
+    }
+}
+
+// Request a timeout decision for a previously accepted report.
+message TimeoutRequest {
+    uint32 episode = 1;
+    Protocol protocol = 2;
+}
+
+// Status wrapper for async timeout computation
+message TimeoutStatus {
+    enum Status {
+        STATUS_UNSPECIFIED = 0;
+        NOT_RECEIVED = 1;
+        PENDING = 2;
+        READY = 3;
+    }
+    uint32 episode = 1;
+    Status status = 2;
+    optional Timeout timeout = 3;
+    // Echoes the report window selected for this episode.
+    uint32 start_tick = 4;
+    uint32 report_seq = 5;
+    uint32 window_consensus_count = 6;
+}
+
+// Consensus service
+service Consensus {
+    // Submit a batch of signed reports for consensus
+    rpc SubmitReportBatch(ReportBatch) returns (google.protobuf.Empty);
+}
+
+// Learning agent service
+service LearningAgent {
+    // Send a report to the agent (status via gRPC error codes if rejected)
+    rpc SendReport(ReportLocal) returns (google.protobuf.Empty);
+
+    // Poll for timeout recommendation for a previously accepted report
+    rpc GetTimeout(TimeoutRequest) returns (TimeoutStatus);
+
+    // Share a report with other agents
+    rpc ShareReport(ReportLocal) returns (google.protobuf.Empty);
+
+    // Receive the final agreed reports from consensus
+    rpc DeliverConsensus(ReportBatch) returns (google.protobuf.Empty);
+
+    // Reset the agent's internal state/model
+    rpc Reset(google.protobuf.Empty) returns (google.protobuf.Empty);
+}

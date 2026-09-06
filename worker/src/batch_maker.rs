@@ -3,19 +3,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
+use adaptive::ack::{tx_seq, AckIndex, ConnId};
 use bytes::Bytes;
-#[cfg(feature = "benchmark")]
 use crypto::Digest;
 use crypto::PublicKey;
-#[cfg(feature = "benchmark")]
 use ed25519_dalek::{Digest as _, Sha512};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::{ReliableSender, SimpleSender};
-#[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -34,9 +33,10 @@ pub struct BatchMaker {
     batch_size: usize,
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
-    /// Channel to receive transactions from the network.
-    rx_transaction: Receiver<Transaction>,
-   
+    /// Channel to receive transactions from the client front, tagged with
+    /// the client connection they arrived on.
+    rx_transaction: Receiver<(ConnId, Transaction)>,
+
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
 
@@ -44,20 +44,26 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch.
     current_batch: Batch,
+    /// (connection, seq) of each conforming tx in `current_batch`, for commit
+    /// acks.
+    current_metas: Vec<(ConnId, u64)>,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: SimpleSender,
+    /// Sealed batches awaiting commit, keyed by digest.
+    ack_index: Arc<AckIndex>,
 }
 
 impl BatchMaker {
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
-        rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler 
+        rx_transaction: Receiver<(ConnId, Transaction)>, //receiver channel from the client front
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        ack_index: Arc<AckIndex>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -65,11 +71,13 @@ impl BatchMaker {
                 max_batch_delay,
                 rx_transaction,
                 //tx_message, //previously forwarded batch to Quorum_waiter; now skipping this step.
-                tx_batch,  
+                tx_batch,
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
+                current_metas: Vec::new(),
                 current_batch_size: 0,
                 network: SimpleSender::new(),
+                ack_index,
             }
             .run()
             .await;
@@ -85,7 +93,13 @@ impl BatchMaker {
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
-                Some(transaction) = self.rx_transaction.recv() => {
+                Some((conn, transaction)) = self.rx_transaction.recv() => {
+                    match tx_seq(&transaction) {
+                        Some(seq) => self.current_metas.push((conn, seq)),
+                        // A tx without the benchmark header cannot be acked;
+                        // it still goes through consensus.
+                        None => debug!("transaction without ack header from conn {}", conn),
+                    }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -132,18 +146,23 @@ impl BatchMaker {
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
+        let metas: Vec<_> = self.current_metas.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
+        // The same digest the Processor computes when storing the batch; the
+        // primary reports commits by this digest.
+        let digest = Digest(
+            Sha512::digest(&serialized).as_slice()[..32]
+                .try_into()
+                .unwrap(),
+        );
+        if !metas.is_empty() {
+            self.ack_index.register(digest.0, metas);
+        }
+
         #[cfg(feature = "benchmark")]
         {
-            // NOTE: This is one extra hash that is only needed to print the following log entries.
-            let digest = Digest(
-                Sha512::digest(&serialized).as_slice()[..32]
-                    .try_into()
-                    .unwrap(),
-            );
-
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.
                 info!(
