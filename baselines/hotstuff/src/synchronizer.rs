@@ -8,7 +8,7 @@ use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
-use network::NetMessage;
+use network::{MessageClass, NetMessage};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
@@ -121,7 +121,7 @@ impl Synchronizer {
             committee.broadcast_addresses(from)
         };
         let bytes = bincode::serialize(message).expect("Failed to serialize core message");
-        let message = NetMessage(Bytes::from(bytes), addresses);
+        let message = NetMessage(Bytes::from(bytes), addresses, MessageClass::Control);
         if let Err(e) = network_channel.send(message).await {
             panic!("Failed to send block through network channel: {}", e);
         }

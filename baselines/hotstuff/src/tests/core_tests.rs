@@ -86,7 +86,7 @@ async fn handle_proposal() {
 
     // Ensure we get a vote back.
     match rx_network.recv().await {
-        Some(NetMessage(bytes, recipient)) => {
+        Some(NetMessage(bytes, recipient, _)) => {
             match bincode::deserialize(&bytes).unwrap() {
                 ConsensusMessage::Vote(v) => assert_eq!(v, vote),
                 _ => assert!(false),
@@ -137,7 +137,7 @@ async fn generate_proposal() {
 
     // Ensure the core sends a new block.
     match rx_network.recv().await {
-        Some(NetMessage(bytes, mut recipients)) => {
+        Some(NetMessage(bytes, mut recipients, _)) => {
             match bincode::deserialize(&bytes).unwrap() {
                 ConsensusMessage::Propose(b) => {
                     assert_eq!(b.round, 2);
@@ -196,7 +196,7 @@ async fn local_timeout_round() {
 
     // Ensure the following operation happen in the right order.
     match rx_network.recv().await {
-        Some(NetMessage(bytes, mut recipients)) => {
+        Some(NetMessage(bytes, mut recipients, _)) => {
             match bincode::deserialize(&bytes).unwrap() {
                 ConsensusMessage::Timeout(t) => assert_eq!(t, timeout),
                 _ => assert!(false),

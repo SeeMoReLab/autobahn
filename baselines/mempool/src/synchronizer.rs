@@ -8,7 +8,7 @@ use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
-use network::NetMessage;
+use network::{MessageClass, NetMessage};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
@@ -227,8 +227,15 @@ pub async fn transmit(
             debug!("Broadcasting {:?}", message);
             committee.broadcast_addresses(&from)
         };
+        // Sealed payloads (broadcasts and request replies) are the bulk
+        // class: large, redundant, and recoverable via sync if dropped.
+        // Payload requests are small and recovery-critical: control class.
+        let class = match message {
+            MempoolMessage::Payload(_) | MempoolMessage::OwnPayload(_) => MessageClass::Bulk,
+            MempoolMessage::PayloadRequest(..) => MessageClass::Control,
+        };
         let bytes = bincode::serialize(message).expect("Failed to serialize core message");
-        let message = NetMessage(Bytes::from(bytes), addresses);
+        let message = NetMessage(Bytes::from(bytes), addresses, class);
         if let Err(e) = network_channel.send(message).await {
             panic!("Failed to send block through network channel: {}", e);
         }

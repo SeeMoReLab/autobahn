@@ -65,7 +65,7 @@ async fn verify_wait() {
 
     // Ensure the synchronizer tries to sync.
     match rx_network.recv().await {
-        Some(NetMessage(bytes, recipient)) => {
+        Some(NetMessage(bytes, recipient, _)) => {
             match bincode::deserialize(&bytes).unwrap() {
                 MempoolMessage::PayloadRequest(p, s) => {
                     assert!(p.iter().all(|x| payload.contains(x)) && p.len() == payload.len());

@@ -16,7 +16,7 @@ use bytes::Bytes;
 use crypto::{Digest, Hash as _, PublicKey, SignatureService};
 use log::{debug, info, warn};
 use mempool::{ConsensusMempoolMessage, MempoolBlock, PayloadStatus};
-use network::{NetMessage, NetReceiver, NetSender};
+use network::{MessageClass, NetMessage, NetReceiver, NetSender};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -616,7 +616,7 @@ impl Engine {
             let bytes = bincode::serialize(&message).expect("Failed to serialize message");
             let _ = self
                 .tx_network
-                .send(NetMessage(Bytes::from(bytes), vec![address]))
+                .send(NetMessage(Bytes::from(bytes), vec![address], MessageClass::Control))
                 .await;
         }
     }
@@ -629,7 +629,7 @@ impl Engine {
         let bytes = bincode::serialize(&message).expect("Failed to serialize message");
         let _ = self
             .tx_network
-            .send(NetMessage(Bytes::from(bytes), addresses))
+            .send(NetMessage(Bytes::from(bytes), addresses, MessageClass::Control))
             .await;
     }
 }
