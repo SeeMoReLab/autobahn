@@ -50,6 +50,7 @@ async fn end_to_end() {
                     rx_consensus_mempool,
                     std::sync::Arc::new(adaptive::ack::AckIndex::new(16)),
                     std::sync::Arc::new(adaptive::ack::AckRouter::new()),
+                    std::sync::Arc::new(adaptive::shadow::ShadowLog::new()),
                 )
                 .unwrap();
                 sleep(Duration::from_millis(100)).await;

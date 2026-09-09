@@ -18,12 +18,6 @@ impl Timer {
         Self { duration, sleep }
     }
 
-    pub fn reset(&mut self) {
-        self.sleep
-            .as_mut()
-            .reset(Instant::now() + Duration::from_millis(self.duration));
-    }
-
     /// Re-arm with a new duration (used by the adaptive timeout cell, which
     /// can change between rounds).
     pub fn reset_after(&mut self, duration_ms: u64) {

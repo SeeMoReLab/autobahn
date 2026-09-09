@@ -12,7 +12,7 @@ use adaptive::episode::LearningManager;
 use adaptive::failure::ProposalDelayController;
 use adaptive::timeouts::TimeoutCell;
 use bytes::Bytes;
-use crypto::{Digest, Hash as _, PublicKey, SignatureService};
+use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, info, warn};
 use mempool::{ConsensusMempoolMessage, MempoolBlock, PayloadStatus};
 use network::{MessageClass, NetMessage, NetReceiver, NetSender};

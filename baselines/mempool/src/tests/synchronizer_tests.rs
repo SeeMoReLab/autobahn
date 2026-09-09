@@ -1,6 +1,5 @@
 use super::*;
 use crate::common::{block, committee, keys, TestBlock};
-use crypto::Hash as _;
 use rand::rngs::StdRng;
 use rand::RngCore as _;
 use rand::SeedableRng as _;

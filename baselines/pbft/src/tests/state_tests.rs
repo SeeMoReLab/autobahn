@@ -64,7 +64,7 @@ impl Sim {
             inboxes.push(VecDeque::new());
             // Capture the initial timer arm.
             let idx = nodes.len() - 1;
-            let mut sim_timers = &mut timers;
+            let sim_timers = &mut timers;
             for action in actions {
                 if let Action::ArmTimer { view, factor } = action {
                     sim_timers[idx] = Some((view, factor));

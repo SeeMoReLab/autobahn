@@ -2,7 +2,8 @@ use crate::config::Export as _;
 use crate::config::{
     Committee, Parameters, PbftCommittee, PbftParameters, SbftCommittee, SbftParameters, Secret,
 };
-use adaptive::ack::{encode_leader_hint, AckIndex, AckRouter};
+use adaptive::ack::{encode_leader_hint, tx_seq, AckIndex, AckRouter};
+use adaptive::shadow::ShadowLog;
 use adaptive::episode::{
     hotstuff_hooks, pbft_hooks, sbft_hooks, LearningConfig, LearningManager, ProtocolHooks,
 };
@@ -14,7 +15,7 @@ use hotstuff::ConsensusError;
 use log::{info, warn};
 use mempool::{Mempool, MempoolError, Payload};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Store, StoreError};
 use thiserror::Error;
@@ -24,6 +25,15 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 /// this, the oldest pending batches are dropped from the ack index and their
 /// transactions surface as client-side timeouts.
 const ACK_INDEX_CAPACITY: usize = 100_000;
+
+/// Shadow arrivals (broadcast client mode) older than this are dropped:
+/// their transactions were shed or lost and will never commit here. Until
+/// then they surface in the oldest_pending gauge.
+const SHADOW_EXPIRY: Duration = Duration::from_secs(30);
+
+/// Cadence of the shadow-e2e log line (and, every fifth tick, the expiry
+/// sweep).
+const SHADOW_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Error, Debug)]
 pub enum NodeError {
@@ -122,6 +132,17 @@ pub struct Node {
     store: Store,
     ack_index: Arc<AckIndex>,
     ack_router: Arc<AckRouter>,
+    /// Arrival stamps of broadcast-mode transactions (see
+    /// [`adaptive::shadow`]); joined against committed payloads to measure
+    /// client-perceived latency locally. Empty outside broadcast mode.
+    shadow_log: Arc<ShadowLog>,
+    /// Client-latency samples resolved at delivery, drained once a second by
+    /// the shadow-e2e reporter task.
+    shadow_samples: Arc<Mutex<Vec<Duration>>>,
+    /// Set once the first client-latency samples feed a learning report, so
+    /// the semantic switch of the report latency fields is logged exactly
+    /// once.
+    shadow_latency_announced: bool,
     learning: Option<Arc<LearningManager>>,
     replica_of: HashMap<PublicKey, u32>,
     /// Stable-leader protocols push leader hints to client connections so a
@@ -154,6 +175,12 @@ impl Node {
         // client.
         let ack_index = Arc::new(AckIndex::new(ACK_INDEX_CAPACITY));
         let ack_router = Arc::new(AckRouter::new());
+
+        // Broadcast-mode client-latency observation: arrivals recorded at
+        // the mempool front, resolved at delivery, reported once a second.
+        let shadow_log = Arc::new(ShadowLog::new());
+        let shadow_samples: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        Self::spawn_shadow_reporter(Arc::clone(&shadow_log), Arc::clone(&shadow_samples));
 
         // Adaptive-timer wiring shared by both protocols.
         let replica_of: HashMap<PublicKey, u32> = match &adaptive_opts.replica_map {
@@ -253,6 +280,7 @@ impl Node {
                     rx_consensus_mempool,
                     Arc::clone(&ack_index),
                     Arc::clone(&ack_router),
+                    Arc::clone(&shadow_log),
                 )?;
 
                 hotstuff::Consensus::run(
@@ -306,6 +334,7 @@ impl Node {
                     rx_consensus_mempool,
                     Arc::clone(&ack_index),
                     Arc::clone(&ack_router),
+                    Arc::clone(&shadow_log),
                 )?;
 
                 pbft::Consensus::run(
@@ -361,6 +390,7 @@ impl Node {
                     rx_consensus_mempool,
                     Arc::clone(&ack_index),
                     Arc::clone(&ack_router),
+                    Arc::clone(&shadow_log),
                 )?;
 
                 sbft::Consensus::run(
@@ -389,10 +419,68 @@ impl Node {
             store,
             ack_index,
             ack_router,
+            shadow_log,
+            shadow_samples,
+            shadow_latency_announced: false,
             learning,
             replica_of,
             emit_leader_hints: matches!(protocol, ProtocolKind::Pbft | ProtocolKind::Sbft),
         })
+    }
+
+    /// Once a second, report the client-latency samples resolved since the
+    /// last tick plus the pending-arrival gauge, and periodically expire
+    /// arrivals whose transactions will never commit. Prints nothing until
+    /// the shadow log sees its first arrival (i.e. outside broadcast client
+    /// mode).
+    fn spawn_shadow_reporter(log: Arc<ShadowLog>, samples: Arc<Mutex<Vec<Duration>>>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SHADOW_REPORT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut ticks: u64 = 0;
+            loop {
+                interval.tick().await;
+                ticks += 1;
+                let mut drained: Vec<Duration> = {
+                    let mut samples = samples.lock().unwrap();
+                    samples.drain(..).collect()
+                };
+                let pending = log.len();
+                if !drained.is_empty() || pending > 0 {
+                    drained.sort_unstable();
+                    let n = drained.len();
+                    let (avg, p10, p50, p95, max) = if n > 0 {
+                        let sum: Duration = drained.iter().sum();
+                        (
+                            (sum / n as u32).as_millis(),
+                            drained[n / 10].as_millis(),
+                            drained[n / 2].as_millis(),
+                            drained[(n * 95 / 100).min(n - 1)].as_millis(),
+                            drained[n - 1].as_millis(),
+                        )
+                    } else {
+                        (0, 0, 0, 0, 0)
+                    };
+                    let oldest = log
+                        .oldest_age()
+                        .map(|age| age.as_millis())
+                        .unwrap_or(0);
+                    info!(
+                        "shadow-e2e: n={} avg_ms={} p10_ms={} p50_ms={} p95_ms={} max_ms={} pending={} oldest_pending_ms={}",
+                        n, avg, p10, p50, p95, max, pending, oldest
+                    );
+                }
+                if ticks % 5 == 0 {
+                    let dropped = log.sweep(SHADOW_EXPIRY);
+                    if dropped > 0 {
+                        warn!(
+                            "shadow-e2e: expired {} arrivals older than {:?} (their txs never committed here)",
+                            dropped, SHADOW_EXPIRY
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Batched HotStuff: rounds are the sequence; the sample view is a
@@ -510,23 +598,72 @@ impl Node {
                 }
             }
 
-            // Feed the learning window: one sample per delivered decision,
-            // with the transaction count read back from the stored payloads.
-            if let Some(learning) = &self.learning {
-                let mut tx_count = 0usize;
+            // Read the committed payloads once for both consumers: the
+            // learning sample's transaction count, and the broadcast-mode
+            // client-latency join (any committed transaction whose arrival
+            // this replica stamped - shadow copy on a follower, tracked real
+            // copy on the ingester - yields one locally measured sample).
+            let shadow_active = !self.shadow_log.is_empty();
+            let mut tx_count = 0usize;
+            let mut resolved: Vec<Duration> = Vec::new();
+            if self.learning.is_some() || shadow_active {
                 for digest in &delivered.payload {
                     match self.store.read(digest.to_vec()).await {
                         Ok(Some(bytes)) => match bincode::deserialize::<Payload>(&bytes) {
-                            Ok(payload) => tx_count += payload.transactions.len(),
+                            Ok(payload) => {
+                                tx_count += payload.transactions.len();
+                                if shadow_active {
+                                    for tx in &payload.transactions {
+                                        if let Some(arrival) =
+                                            tx_seq(tx).and_then(|seq| self.shadow_log.take(seq))
+                                        {
+                                            resolved.push(
+                                                delivered
+                                                    .committed_at
+                                                    .saturating_duration_since(arrival),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             Err(e) => warn!("Failed to deserialize committed payload: {}", e),
                         },
                         Ok(None) => warn!("Committed payload {} missing from store", digest),
                         Err(e) => warn!("Failed to read committed payload: {}", e),
                     }
                 }
-                let latencies = match delivered.first_seen {
-                    Some(first_seen) => vec![delivered.committed_at - first_seen],
-                    None => Vec::new(),
+            }
+            if !resolved.is_empty() {
+                self.shadow_samples
+                    .lock()
+                    .unwrap()
+                    .extend(resolved.iter().copied());
+                if self.learning.is_some() && !self.shadow_latency_announced {
+                    self.shadow_latency_announced = true;
+                    info!(
+                        "shadow-e2e: broadcast client mode detected; the agent report \
+                         latency fields now carry client-perceived (arrival-to-commit) \
+                         latencies instead of consensus latencies"
+                    );
+                }
+            }
+
+            // Feed the learning window: in broadcast client mode the latency
+            // stream is the per-transaction client-perceived samples; outside
+            // it, the per-decision consensus latency (first pre-prepare to
+            // delivery), as before. A broadcast-mode delivery with no tracked
+            // transactions (heartbeat, or replayed foreign history)
+            // contributes no latency samples rather than mixing semantics.
+            if let Some(learning) = &self.learning {
+                let latencies = if !resolved.is_empty() {
+                    resolved
+                } else if shadow_active {
+                    Vec::new()
+                } else {
+                    match delivered.first_seen {
+                        Some(first_seen) => vec![delivered.committed_at - first_seen],
+                        None => Vec::new(),
+                    }
                 };
                 // Leader ids are 1-based in the report samples; 0 = unknown.
                 let leader_id = self

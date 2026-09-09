@@ -52,6 +52,7 @@ async fn core(
         parameters.max_payload_size,
         parameters.min_block_delay,
         Arc::new(AckIndex::new(16)),
+        Arc::new(adaptive::shadow::ShadowLog::new()),
         rx_client,
         tx_core.clone(),
     );

@@ -10,7 +10,10 @@
 //! errors. A `Monitor` line in the SmartBFT smallbank format is printed every
 //! `monitor_interval`.
 
-use crate::ack::{decode_ack_frame, decode_leader_hint, TX_HEADER_BYTES};
+use crate::ack::{
+    decode_ack_frame, decode_leader_hint, TX_HEADER_BYTES, TX_TAG_REAL, TX_TAG_SHADOW,
+    TX_TAG_TRACKED,
+};
 use crate::monitor::{diff_snapshot, format_results, BenchmarkMetrics, MetricsSnapshot};
 use crate::timestamped_log_tag;
 use anyhow::{bail, Context, Result};
@@ -27,6 +30,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 const CONNECT_RETRY: Duration = Duration::from_millis(200);
 const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
+type TxSink = futures::stream::SplitSink<Framed<TcpStream, LengthDelimitedCodec>, bytes::Bytes>;
+type TxStream = futures::stream::SplitStream<Framed<TcpStream, LengthDelimitedCodec>>;
+
 /// How transactions are distributed over the replica fronts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetMode {
@@ -38,6 +44,13 @@ pub enum TargetMode {
     /// PBFT-style submission; the leader batches everything, as in the
     /// SmartBFT baseline). Only meaningful for stable-leader protocols.
     Leader,
+    /// Like `Leader` for the real transaction stream, but every other front
+    /// additionally receives the 9-byte header of each transaction as a
+    /// shadow copy (classical PBFT client broadcast). Followers timestamp
+    /// the shadow arrivals, giving every replica a local, leader-independent
+    /// measure of client-perceived latency. Only meaningful for
+    /// stable-leader protocols.
+    Broadcast,
 }
 
 impl TargetMode {
@@ -45,13 +58,20 @@ impl TargetMode {
         match raw {
             "spread" => Ok(Self::Spread),
             "leader" => Ok(Self::Leader),
+            "broadcast" => Ok(Self::Broadcast),
             other => Err(format!(
-                "unknown target mode {:?}; expected spread or leader",
+                "unknown target mode {:?}; expected spread, leader, or broadcast",
                 other
             )),
         }
     }
 }
+
+/// Broadcast mode stripes each lane's seqs into a disjoint range so that a
+/// seq is globally unique across the client process (replica-side arrival
+/// tracking is keyed by seq alone). 2^48 transactions per lane is years of
+/// runtime at benchmark rates.
+const LANE_SHIFT: u32 = 48;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -215,7 +235,9 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
         TargetMode::Spread => {
             cfg.rate as f64 / (cfg.targets.len() * cfg.connections_per_target) as f64
         }
-        TargetMode::Leader => cfg.rate as f64 / cfg.connections_per_target as f64,
+        TargetMode::Leader | TargetMode::Broadcast => {
+            cfg.rate as f64 / cfg.connections_per_target as f64
+        }
     };
     // Front index (targets order) currently believed to be the leader;
     // updated when a quorum of leader hints agrees (see LeaderTracker).
@@ -225,42 +247,93 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
     // arrive within a block delay.
     let leader_index = Arc::new(AtomicUsize::new(usize::MAX));
     let tracker = Arc::new(Mutex::new(LeaderTracker::new(cfg.targets.len())));
-    if cfg.target_mode == TargetMode::Leader {
-        client_println!("leader mode: waiting for a leader hint quorum before submitting");
+    if matches!(cfg.target_mode, TargetMode::Leader | TargetMode::Broadcast) {
+        client_println!(
+            "{:?} mode: waiting for a leader hint quorum before submitting",
+            cfg.target_mode
+        );
     }
 
     let mut tasks = Vec::new();
-    for (conn_index, framed) in connections.into_iter().enumerate() {
-        let front = conn_index / cfg.connections_per_target;
-        let outstanding: Arc<Mutex<HashMap<u64, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (sink, stream) = framed.split();
-        let target = cfg.targets[front];
+    match cfg.target_mode {
+        TargetMode::Spread | TargetMode::Leader => {
+            for (conn_index, framed) in connections.into_iter().enumerate() {
+                let front = conn_index / cfg.connections_per_target;
+                let outstanding: Arc<Mutex<HashMap<u64, Instant>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                let (sink, stream) = framed.split();
+                let target = cfg.targets[front];
 
-        tasks.push(tokio::spawn(sender(
-            sink,
-            target,
-            per_sender_rate,
-            cfg.tx_size,
-            cfg.target_mode,
-            front,
-            Arc::clone(&leader_index),
-            Arc::clone(&outstanding),
-            Arc::clone(&metrics),
-        )));
-        tasks.push(tokio::spawn(receiver(
-            stream,
-            target,
-            front,
-            Arc::clone(&tracker),
-            Arc::clone(&leader_index),
-            Arc::clone(&outstanding),
-            Arc::clone(&metrics),
-        )));
-        tasks.push(tokio::spawn(sweeper(
-            cfg.request_timeout,
-            Arc::clone(&outstanding),
-            Arc::clone(&metrics),
-        )));
+                tasks.push(tokio::spawn(sender(
+                    sink,
+                    target,
+                    per_sender_rate,
+                    cfg.tx_size,
+                    cfg.target_mode,
+                    front,
+                    Arc::clone(&leader_index),
+                    Arc::clone(&outstanding),
+                    Arc::clone(&metrics),
+                )));
+                tasks.push(tokio::spawn(receiver(
+                    stream,
+                    target,
+                    front,
+                    Arc::clone(&tracker),
+                    Arc::clone(&leader_index),
+                    Arc::clone(&outstanding),
+                    Arc::clone(&metrics),
+                )));
+                tasks.push(tokio::spawn(sweeper(
+                    cfg.request_timeout,
+                    Arc::clone(&outstanding),
+                    Arc::clone(&metrics),
+                )));
+            }
+        }
+        TargetMode::Broadcast => {
+            // Lane structure: lane k owns connection k of every front, so
+            // one sender can push the real transaction to the leader and the
+            // shadow header everywhere else. Acks for a lane's transactions
+            // arrive on whichever of the lane's connections ingested them,
+            // so the outstanding map is shared per lane, not per connection.
+            let mut slots: Vec<Option<_>> = connections.into_iter().map(Some).collect();
+            for lane in 0..cfg.connections_per_target {
+                let outstanding: Arc<Mutex<HashMap<u64, Instant>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                let mut sinks: Vec<Option<TxSink>> = Vec::with_capacity(cfg.targets.len());
+                for front in 0..cfg.targets.len() {
+                    let framed = slots[front * cfg.connections_per_target + lane]
+                        .take()
+                        .expect("every lane slot is taken exactly once");
+                    let (sink, stream) = framed.split();
+                    sinks.push(Some(sink));
+                    tasks.push(tokio::spawn(receiver(
+                        stream,
+                        cfg.targets[front],
+                        front,
+                        Arc::clone(&tracker),
+                        Arc::clone(&leader_index),
+                        Arc::clone(&outstanding),
+                        Arc::clone(&metrics),
+                    )));
+                }
+                tasks.push(tokio::spawn(broadcast_sender(
+                    sinks,
+                    cfg.targets.clone(),
+                    lane,
+                    per_sender_rate,
+                    cfg.tx_size,
+                    Arc::clone(&leader_index),
+                    Arc::clone(&outstanding),
+                )));
+                tasks.push(tokio::spawn(sweeper(
+                    cfg.request_timeout,
+                    Arc::clone(&outstanding),
+                    Arc::clone(&metrics),
+                )));
+            }
+        }
     }
 
     let monitor = tokio::spawn(monitor_loop(cfg.monitor_interval, Arc::clone(&metrics)));
@@ -336,7 +409,7 @@ async fn wait_for_start(start_unix_ms: Option<u64>) {
 
 #[allow(clippy::too_many_arguments)]
 async fn sender(
-    mut sink: futures::stream::SplitSink<Framed<TcpStream, LengthDelimitedCodec>, bytes::Bytes>,
+    mut sink: TxSink,
     target: SocketAddr,
     rate: f64,
     tx_size: usize,
@@ -378,12 +451,15 @@ async fn sender(
                 credit -= burst as f64;
                 burst
             }
+            TargetMode::Broadcast => {
+                unreachable!("broadcast mode spawns broadcast_sender, not sender")
+            }
         };
 
         for _ in 0..burst {
             seq += 1;
             let mut tx = BytesMut::with_capacity(tx_size);
-            tx.put_u8(1u8);
+            tx.put_u8(TX_TAG_REAL);
             tx.put_u64(seq);
             tx.resize(tx_size, 0u8);
             outstanding.lock().unwrap().insert(seq, Instant::now());
@@ -403,8 +479,126 @@ async fn sender(
     }
 }
 
+/// The broadcast-mode sender for one lane. Paces like the Leader-mode
+/// sender; per transaction, the real (tracked) copy is fed to the adopted
+/// leader's sink and the 9-byte shadow header to every other front, with one
+/// flush per sink per burst. A failed shadow sink is dropped (that front
+/// simply stops observing this lane); a failed leader sink ends the lane,
+/// like the plain sender - its outstanding transactions surface as errors
+/// via the sweeper.
+#[allow(clippy::too_many_arguments)]
+async fn broadcast_sender(
+    mut sinks: Vec<Option<TxSink>>,
+    targets: Vec<SocketAddr>,
+    lane: usize,
+    rate: f64,
+    tx_size: usize,
+    leader_index: Arc<AtomicUsize>,
+    outstanding: Arc<Mutex<HashMap<u64, Instant>>>,
+) {
+    const PRECISION: u64 = 20; // pacing ticks per second
+    let tick_period = Duration::from_millis(1000 / PRECISION);
+    let mut interval = tokio::time::interval(tick_period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+
+    let mut counter: u64 = 0;
+    // Credit accumulator, as in Leader mode: no burst of the missed
+    // allowance after an inactive stretch.
+    let mut credit: f64 = 0.0;
+    loop {
+        interval.tick().await;
+        let tick_start = Instant::now();
+        let adopted = leader_index.load(Ordering::Relaxed);
+        if adopted >= sinks.len() {
+            credit = 0.0;
+            continue;
+        }
+        if sinks[adopted].is_none() {
+            client_println!(
+                "lane {}: connection to adopted leader {} is gone; lane stops",
+                lane,
+                targets[adopted]
+            );
+            return;
+        }
+        credit += rate / PRECISION as f64;
+        let burst = credit as u64;
+        credit -= burst as f64;
+
+        for _ in 0..burst {
+            counter += 1;
+            let seq = ((lane as u64) << LANE_SHIFT) | counter;
+            let mut shadow = BytesMut::with_capacity(TX_HEADER_BYTES);
+            shadow.put_u8(TX_TAG_SHADOW);
+            shadow.put_u64(seq);
+            let shadow = shadow.freeze();
+            let mut tx = BytesMut::with_capacity(tx_size);
+            tx.put_u8(TX_TAG_TRACKED);
+            tx.put_u64(seq);
+            tx.resize(tx_size, 0u8);
+            outstanding.lock().unwrap().insert(seq, Instant::now());
+            // Shadows are fed before the real copy so a follower's arrival
+            // stamp is never later than the leader's ingest.
+            for front in 0..sinks.len() {
+                if front == adopted {
+                    continue;
+                }
+                if let Some(sink) = sinks[front].as_mut() {
+                    if let Err(err) = sink.feed(shadow.clone()).await {
+                        client_println!(
+                            "lane {}: shadow stream to {} failed: {}; front dropped from shadowing",
+                            lane,
+                            targets[front],
+                            err
+                        );
+                        sinks[front] = None;
+                    }
+                }
+            }
+            let sink = sinks[adopted].as_mut().expect("checked at tick start");
+            if let Err(err) = sink.feed(tx.freeze()).await {
+                client_println!(
+                    "lane {}: connection to leader {} failed: {}",
+                    lane,
+                    targets[adopted],
+                    err
+                );
+                return;
+            }
+        }
+        if burst > 0 {
+            for front in 0..sinks.len() {
+                if let Some(sink) = sinks[front].as_mut() {
+                    if let Err(err) = sink.flush().await {
+                        if front == adopted {
+                            client_println!(
+                                "lane {}: connection to leader {} failed: {}",
+                                lane,
+                                targets[adopted],
+                                err
+                            );
+                            return;
+                        }
+                        client_println!(
+                            "lane {}: shadow stream to {} failed: {}; front dropped from shadowing",
+                            lane,
+                            targets[front],
+                            err
+                        );
+                        sinks[front] = None;
+                    }
+                }
+            }
+        }
+
+        if tick_start.elapsed() > tick_period {
+            client_println!("transaction rate too high for this client (lane {})", lane);
+        }
+    }
+}
+
 async fn receiver(
-    mut stream: futures::stream::SplitStream<Framed<TcpStream, LengthDelimitedCodec>>,
+    mut stream: TxStream,
     target: SocketAddr,
     front: usize,
     tracker: Arc<Mutex<LeaderTracker>>,

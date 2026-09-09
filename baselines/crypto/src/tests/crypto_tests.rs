@@ -6,7 +6,7 @@ use rand::SeedableRng as _;
 
 impl Hash for &[u8] {
     fn digest(&self) -> Digest {
-        Digest(Sha512::digest(self).as_slice()[..32].try_into().unwrap())
+        Digest(Sha512::digest(self)[..32].try_into().unwrap())
     }
 }
 

@@ -85,7 +85,7 @@ impl Hash for Block {
             hasher.update(x);
         }
         hasher.update(&self.qc.hash);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -151,7 +151,7 @@ impl Hash for Vote {
         let mut hasher = Sha512::new();
         hasher.update(&self.hash);
         hasher.update(self.round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -203,7 +203,7 @@ impl Hash for QC {
         let mut hasher = Sha512::new();
         hasher.update(&self.hash);
         hasher.update(self.round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -270,7 +270,7 @@ impl Hash for Timeout {
         let mut hasher = Sha512::new();
         hasher.update(self.round.to_le_bytes());
         hasher.update(self.high_qc.round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -308,7 +308,7 @@ impl TC {
             let mut hasher = Sha512::new();
             hasher.update(self.round.to_le_bytes());
             hasher.update(high_qc_round.to_le_bytes());
-            let digest = Digest(hasher.finalize().as_slice()[..32].try_into().unwrap());
+            let digest = Digest(hasher.finalize()[..32].try_into().unwrap());
             signature.verify(&digest, &author)?;
         }
         Ok(())

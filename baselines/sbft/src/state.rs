@@ -239,6 +239,9 @@ impl Sbft {
         self.last_delivered
     }
 
+    // Only the state tests observe activity directly; the engine reacts to
+    // actions instead.
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.status == Status::Active
     }

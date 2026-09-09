@@ -6,6 +6,7 @@ use crate::payload::PayloadMaker;
 use crate::interface::{ConsensusMempoolMessage, MempoolBlock};
 use crate::synchronizer::Synchronizer;
 use adaptive::ack::{AckIndex, AckRouter};
+use adaptive::shadow::ShadowLog;
 use crypto::{PublicKey, SignatureService};
 use log::info;
 use network::{NetReceiver, NetSender};
@@ -30,6 +31,7 @@ impl Mempool {
         consensus_mempool_channel: Receiver<ConsensusMempoolMessage<B>>,
         ack_index: Arc<AckIndex>,
         ack_router: Arc<AckRouter>,
+        shadow_log: Arc<ShadowLog>,
     ) -> MempoolResult<()> {
         // NOTE: The following log entries are used to compute performance.
         info!(
@@ -100,6 +102,7 @@ impl Mempool {
             parameters.max_payload_size,
             parameters.min_block_delay,
             ack_index,
+            shadow_log,
             rx_client,
             tx_core,
         );

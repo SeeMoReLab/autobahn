@@ -1,6 +1,7 @@
 use crate::core::MempoolMessage;
 use crate::messages::{Payload, Transaction};
-use adaptive::ack::{tx_seq, AckIndex, ConnId};
+use adaptive::ack::{tx_seq, tx_tag, AckIndex, ConnId, TX_TAG_SHADOW, TX_TAG_TRACKED};
+use adaptive::shadow::ShadowLog;
 use crypto::Hash as _;
 use crypto::{PublicKey, SignatureService};
 use log::debug;
@@ -20,18 +21,21 @@ struct Runner {
     name: PublicKey,
     signature_service: SignatureService,
     ack_index: Arc<AckIndex>,
+    shadow_log: Arc<ShadowLog>,
     client_channel: Receiver<(ConnId, Transaction)>,
     core_channel: Sender<MempoolMessage>,
     request_channel: Receiver<oneshot::Sender<Payload>>,
 }
 
 impl Runner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: PublicKey,
         signature_service: SignatureService,
         max_size: usize,
         min_block_delay: u64,
         ack_index: Arc<AckIndex>,
+        shadow_log: Arc<ShadowLog>,
         client_channel: Receiver<(ConnId, Transaction)>,
         core_channel: Sender<MempoolMessage>,
         request_channel: Receiver<oneshot::Sender<Payload>>,
@@ -45,6 +49,7 @@ impl Runner {
             name,
             signature_service,
             ack_index,
+            shadow_log,
             client_channel,
             core_channel,
             request_channel,
@@ -52,6 +57,18 @@ impl Runner {
     }
 
     async fn add(&mut self, conn: ConnId, tx: Transaction) -> Option<Payload> {
+        // Broadcast-mode client-latency observation: a shadow copy only
+        // stamps the arrival and is never sealed; a tracked real
+        // transaction stamps the arrival and then goes the normal way.
+        // Both carry globally unique seqs (see the client's lane striping).
+        match (tx_tag(&tx), tx_seq(&tx)) {
+            (Some(TX_TAG_SHADOW), Some(seq)) => {
+                self.shadow_log.record(seq);
+                return None;
+            }
+            (Some(TX_TAG_TRACKED), Some(seq)) => self.shadow_log.record(seq),
+            _ => {}
+        }
         let length = tx.len();
         let ret = match self.size + length > self.max_size {
             true => Some(self.make().await),
@@ -141,12 +158,14 @@ pub struct PayloadMaker {
 }
 
 impl PayloadMaker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: PublicKey,
         signature_service: SignatureService,
         max_size: usize,
         min_block_delay: u64,
         ack_index: Arc<AckIndex>,
+        shadow_log: Arc<ShadowLog>,
         client_channel: Receiver<(ConnId, Transaction)>,
         core_channel: Sender<MempoolMessage>,
     ) -> Self {
@@ -158,6 +177,7 @@ impl PayloadMaker {
                 max_size,
                 min_block_delay,
                 ack_index,
+                shadow_log,
                 client_channel,
                 core_channel,
                 rx_request,

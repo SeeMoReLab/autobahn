@@ -19,7 +19,7 @@ pub fn content_digest(payload: &[Digest]) -> Digest {
     for x in payload {
         hasher.update(x);
     }
-    Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+    Digest(hasher.finalize()[..32].try_into().unwrap())
 }
 
 /// A pre-prepare: the view leader's batch proposal for one sequence number.
@@ -77,7 +77,7 @@ impl Hash for Batch {
             hasher.update(x);
         }
         hasher.update(self.author.0);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -154,7 +154,7 @@ impl Hash for Vote {
         hasher.update(self.seq.to_le_bytes());
         hasher.update(&self.digest);
         hasher.update(self.author.0);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -301,7 +301,7 @@ impl Hash for ViewChangeMsg {
             hasher.update((cert.prepares.len() as u64).to_le_bytes());
         }
         hasher.update(self.author.0);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
@@ -386,7 +386,7 @@ impl Hash for NewViewMsg {
             hasher.update(Hash::digest(batch));
         }
         hasher.update(self.author.0);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 

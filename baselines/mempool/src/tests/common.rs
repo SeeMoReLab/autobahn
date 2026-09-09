@@ -25,7 +25,7 @@ impl crypto::Hash for TestBlock {
         for x in &self.payload {
             hasher.update(x);
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 

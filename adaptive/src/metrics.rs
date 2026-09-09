@@ -19,7 +19,10 @@ pub struct LearningSample {
     pub batch_size: usize,
     /// When the decision was made locally.
     pub decision_time: Instant,
-    /// Consensus latencies (proposal-to-commit) attributed to this decision.
+    /// Latencies attributed to this decision. Outside broadcast client mode:
+    /// one consensus latency (first pre-prepare to delivery). In broadcast
+    /// client mode: one client-perceived (arrival-to-commit) latency per
+    /// committed tracked transaction, from the replica's shadow log.
     pub latencies: Vec<Duration>,
     /// The timeout in force when the decision committed (0 = unchanged).
     pub timeout: Duration,

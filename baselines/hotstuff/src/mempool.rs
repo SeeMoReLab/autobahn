@@ -1,7 +1,6 @@
 use crate::core::{ConsensusMessage, RoundNumber};
 use crate::messages::Block;
 use ::mempool::{ConsensusMempoolMessage, MempoolBlock, PayloadStatus};
-use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, warn};
 use tokio::sync::mpsc::Sender;

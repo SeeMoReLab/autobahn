@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The total rate (txs/s), split across targets'")
         .args_from_usage("--request-timeout=<INT> 'Unacked transactions count as errors after this many ms'")
-        .args_from_usage("--target-mode=[MODE] 'spread: split rate across all replicas (default); leader: send everything to the current leader, following leader hints'")
+        .args_from_usage("--target-mode=[MODE] 'spread: split rate across all replicas (default); leader: send everything to the current leader, following leader hints; broadcast: like leader, plus shadow tx headers to every other replica so followers can measure client latency'")
         .args_from_usage("--connections-per-target=[INT] 'Parallel connections (independent senders) per replica (default 4)'")
         .args_from_usage("--monitor-interval=[INT] 'Milliseconds between Monitor lines (default 1000)'")
         .args_from_usage("--start-unix-ms=[INT] 'Epoch ms at which to start submitting'")

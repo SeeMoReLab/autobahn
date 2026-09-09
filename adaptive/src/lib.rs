@@ -18,6 +18,7 @@ pub mod front;
 pub mod metrics;
 pub mod monitor;
 pub mod report;
+pub mod shadow;
 pub mod timeouts;
 
 /// Generated types and gRPC client stubs for `proto/agent.proto`.

@@ -25,6 +25,27 @@ pub type ConnId = u64;
 /// Minimum transaction size: tag byte + u64 sequence.
 pub const TX_HEADER_BYTES: usize = 9;
 
+/// Tag of an ordinary benchmark transaction (spread and leader client modes;
+/// per-connection seq space, arrival not tracked replica-side).
+pub const TX_TAG_REAL: u8 = 1;
+
+/// Tag of a shadow copy (broadcast client mode): the 9-byte header of a real
+/// transaction, sent to every non-leader front purely so that replica can
+/// timestamp the arrival. Never sealed into a payload, never acked.
+pub const TX_TAG_SHADOW: u8 = 2;
+
+/// Tag of a tracked real transaction (broadcast client mode): sealed and
+/// acked like [`TX_TAG_REAL`], and additionally arrival-timestamped by the
+/// ingesting replica. Its seq is globally unique (lane-striped), unlike the
+/// per-connection seqs of untracked transactions, which is what makes
+/// replica-side tracking by seq sound.
+pub const TX_TAG_TRACKED: u8 = 3;
+
+/// The tag byte of a transaction; None if it is too short to carry one.
+pub fn tx_tag(tx: &[u8]) -> Option<u8> {
+    tx.first().copied()
+}
+
 /// Parse the per-connection sequence number out of a transaction.
 pub fn tx_seq(tx: &[u8]) -> Option<u64> {
     if tx.len() < TX_HEADER_BYTES {

@@ -44,7 +44,7 @@ impl Hash for Payload {
         for transaction in &self.transactions {
             hasher.update(transaction);
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
