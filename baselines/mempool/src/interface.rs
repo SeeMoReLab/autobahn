@@ -1,5 +1,5 @@
 //! The mempool <-> consensus interface. The mempool is generic over the
-//! consensus block type so batched HotStuff and PBFT can share it: consensus
+//! consensus block type so protocols with different blocks can share it: consensus
 //! asks for payload digests to propose (`Get`), asks whether a block's
 //! payloads are locally available (`Verify`, with missing payloads synced in
 //! the background and the block looped back on arrival), and reports

@@ -76,104 +76,6 @@ pub struct ProtocolHooks {
     pub timeout_ms: Box<dyn Fn(&pb::timeout::Value) -> u32 + Send + Sync>,
 }
 
-/// Ready-made hooks for PBFT: a single election-timeout knob written to
-/// `cell`, reports built by [`crate::report::build_pbft_report`].
-pub fn pbft_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
-    let initial_ms = cell.get().as_millis().min(u32::MAX as u128) as u32;
-    let apply_cell = cell.clone();
-    ProtocolHooks {
-        protocol: pb::Protocol::Pbft,
-        initial_timeout: pb::timeout::Value::Pbft(pb::PbftTimeout {
-            election_timeout_milliseconds: initial_ms,
-        }),
-        build_state: Box::new(|snap| {
-            pb::report_local::State::PbftState(crate::report::build_pbft_report(snap))
-        }),
-        build_reward: Box::new(|episode, snap, used| {
-            let timeout_used = match used {
-                pb::timeout::Value::Pbft(t) => t.clone(),
-                other => panic!("PBFT reward built with non-PBFT timeout {:?}", other),
-            };
-            pb::reward::Value::Pbft(pb::PbftReward {
-                episode,
-                report: Some(crate::report::build_pbft_report(snap)),
-                timeout_used: Some(timeout_used),
-            })
-        }),
-        apply_timeout: Box::new(move |value| match value {
-            pb::timeout::Value::Pbft(t) => {
-                if t.election_timeout_milliseconds == 0 {
-                    bail!("non-positive election timeout");
-                }
-                apply_cell.set(Duration::from_millis(t.election_timeout_milliseconds as u64));
-                Ok(())
-            }
-            other => bail!("expected PBFT timeout, got {:?}", other),
-        }),
-        timeout_ms: Box::new(|value| match value {
-            pb::timeout::Value::Pbft(t) => t.election_timeout_milliseconds,
-            _ => 0,
-        }),
-    }
-}
-
-/// Ready-made hooks for SBFT: three knobs (election, slow_path, batch);
-/// `timeout_ms` reports the election timeout.
-pub fn sbft_hooks(cells: crate::timeouts::SbftTimeoutCells) -> ProtocolHooks {
-    let as_ms = |cell: &crate::timeouts::TimeoutCell| {
-        cell.get().as_millis().min(u32::MAX as u128) as u32
-    };
-    let initial = pb::SbftTimeout {
-        election_timeout_milliseconds: as_ms(&cells.election),
-        slow_path_timeout_milliseconds: as_ms(&cells.slow_path),
-        batch_timeout_milliseconds: as_ms(&cells.batch),
-    };
-    let apply_cells = cells.clone();
-    ProtocolHooks {
-        protocol: pb::Protocol::Sbft,
-        initial_timeout: pb::timeout::Value::Sbft(initial),
-        build_state: Box::new(|snap| {
-            pb::report_local::State::SbftState(crate::report::build_sbft_report(snap))
-        }),
-        build_reward: Box::new(|episode, snap, used| {
-            let timeout_used = match used {
-                pb::timeout::Value::Sbft(t) => t.clone(),
-                other => panic!("SBFT reward built with non-SBFT timeout {:?}", other),
-            };
-            pb::reward::Value::Sbft(pb::SbftReward {
-                episode,
-                report: Some(crate::report::build_sbft_report(snap)),
-                timeout_used: Some(timeout_used),
-            })
-        }),
-        apply_timeout: Box::new(move |value| match value {
-            pb::timeout::Value::Sbft(t) => {
-                if t.election_timeout_milliseconds == 0
-                    || t.slow_path_timeout_milliseconds == 0
-                    || t.batch_timeout_milliseconds == 0
-                {
-                    bail!("non-positive SBFT timeout component: {:?}", t);
-                }
-                apply_cells
-                    .election
-                    .set(Duration::from_millis(t.election_timeout_milliseconds as u64));
-                apply_cells
-                    .slow_path
-                    .set(Duration::from_millis(t.slow_path_timeout_milliseconds as u64));
-                apply_cells
-                    .batch
-                    .set(Duration::from_millis(t.batch_timeout_milliseconds as u64));
-                Ok(())
-            }
-            other => bail!("expected SBFT timeout, got {:?}", other),
-        }),
-        timeout_ms: Box::new(|value| match value {
-            pb::timeout::Value::Sbft(t) => t.election_timeout_milliseconds,
-            _ => 0,
-        }),
-    }
-}
-
 /// Ready-made hooks for batched HotStuff: a single timeout_delay knob
 /// written to `cell`, reports built by [`crate::report::build_hotstuff_report`].
 pub fn hotstuff_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
@@ -681,75 +583,32 @@ mod tests {
     use crate::timeouts::TimeoutCell;
 
     #[test]
-    fn sbft_hooks_roundtrip() {
-        let cells = crate::timeouts::SbftTimeoutCells::new(
-            Duration::from_millis(5000),
-            Duration::from_millis(1000),
-            Duration::from_millis(100),
-        );
-        let hooks = sbft_hooks(cells.clone());
-        assert_eq!((hooks.timeout_ms)(&hooks.initial_timeout), 5000);
-
-        let recommendation = pb::timeout::Value::Sbft(pb::SbftTimeout {
-            election_timeout_milliseconds: 900,
-            slow_path_timeout_milliseconds: 400,
-            batch_timeout_milliseconds: 150,
-        });
-        (hooks.apply_timeout)(&recommendation).unwrap();
-        assert_eq!(cells.election.get(), Duration::from_millis(900));
-        assert_eq!(cells.slow_path.get(), Duration::from_millis(400));
-        assert_eq!(cells.batch.get(), Duration::from_millis(150));
-
-        // A zero component must be rejected, not applied.
-        let zero = pb::timeout::Value::Sbft(pb::SbftTimeout {
-            election_timeout_milliseconds: 900,
-            slow_path_timeout_milliseconds: 0,
-            batch_timeout_milliseconds: 150,
-        });
-        assert!((hooks.apply_timeout)(&zero).is_err());
-        assert_eq!(cells.slow_path.get(), Duration::from_millis(400));
-
-        // Reward echoes the exact applied value.
-        let snap = WindowSnapshot::default();
-        match (hooks.build_reward)(2, &snap, &recommendation) {
-            pb::reward::Value::Sbft(reward) => {
-                assert_eq!(reward.episode, 2);
-                let used = reward.timeout_used.unwrap();
-                assert_eq!(used.election_timeout_milliseconds, 900);
-                assert_eq!(used.slow_path_timeout_milliseconds, 400);
-                assert_eq!(used.batch_timeout_milliseconds, 150);
-            }
-            other => panic!("unexpected reward {:?}", other),
-        }
-    }
-
-    #[test]
-    fn pbft_hooks_roundtrip() {
+    fn hotstuff_hooks_roundtrip() {
         let cell = TimeoutCell::new(Duration::from_millis(800));
-        let hooks = pbft_hooks(cell.clone());
+        let hooks = hotstuff_hooks(cell.clone());
         assert_eq!((hooks.timeout_ms)(&hooks.initial_timeout), 800);
 
-        let recommendation = pb::timeout::Value::Pbft(pb::PbftTimeout {
-            election_timeout_milliseconds: 1800,
+        let recommendation = pb::timeout::Value::Hotstuff(pb::HotstuffTimeout {
+            timeout_delay_milliseconds: 2000,
         });
         (hooks.apply_timeout)(&recommendation).unwrap();
-        assert_eq!(cell.get(), Duration::from_millis(1800));
+        assert_eq!(cell.get(), Duration::from_millis(2000));
 
         // Zero timeouts must be rejected, not applied.
-        let zero = pb::timeout::Value::Pbft(pb::PbftTimeout {
-            election_timeout_milliseconds: 0,
+        let zero = pb::timeout::Value::Hotstuff(pb::HotstuffTimeout {
+            timeout_delay_milliseconds: 0,
         });
         assert!((hooks.apply_timeout)(&zero).is_err());
-        assert_eq!(cell.get(), Duration::from_millis(1800));
+        assert_eq!(cell.get(), Duration::from_millis(2000));
 
         // Reward echoes the exact applied value.
         let snap = WindowSnapshot::default();
         match (hooks.build_reward)(3, &snap, &recommendation) {
-            pb::reward::Value::Pbft(reward) => {
+            pb::reward::Value::Hotstuff(reward) => {
                 assert_eq!(reward.episode, 3);
                 assert_eq!(
-                    reward.timeout_used.unwrap().election_timeout_milliseconds,
-                    1800
+                    reward.timeout_used.unwrap().timeout_delay_milliseconds,
+                    2000
                 );
             }
             other => panic!("unexpected reward {:?}", other),

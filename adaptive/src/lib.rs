@@ -6,8 +6,8 @@
 //! format, and proposal-delay injection are the SmartBFT smallbank harness
 //! (SmartBFT/examples/smallbank/{learning,learning_metrics,metrics,failure}.go
 //! in the adaptive-timer parent repo). Behavior here deliberately mirrors that
-//! implementation so PBFT runs can share the same agent models, schedules, and
-//! failure specs.
+//! implementation so HotStuff and Autobahn runs can share the same agent
+//! models, schedules, and failure specs.
 
 pub mod ack;
 pub mod agent;

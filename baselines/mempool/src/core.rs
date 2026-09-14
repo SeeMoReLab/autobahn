@@ -1,3 +1,6 @@
+use adaptive::ack::tx_seq;
+use adaptive::shadow::ShadowLog;
+use std::sync::Arc;
 use crate::config::{Committee, Parameters};
 use crate::error::{MempoolError, MempoolResult};
 use crate::messages::Payload;
@@ -48,6 +51,10 @@ pub struct Core<B: MempoolBlock> {
     order: VecDeque<Digest>,
     /// Total transactions across `queued`, for the intake bound.
     queued_transactions: usize,
+    /// Broadcast-mode request bookkeeping: every stored payload marks its
+    /// requests pipelined (a client retry must not seal them again), and
+    /// shed own payloads drop their entries (a retry re-ingests them).
+    shadow_log: Arc<ShadowLog>,
 }
 
 impl<B: MempoolBlock> Core<B> {
@@ -62,6 +69,7 @@ impl<B: MempoolBlock> Core<B> {
         core_channel: Receiver<MempoolMessage>,
         consensus_channel: Receiver<ConsensusMempoolMessage<B>>,
         network_channel: Sender<NetMessage>,
+        shadow_log: Arc<ShadowLog>,
     ) -> Self {
         Self {
             name,
@@ -76,6 +84,16 @@ impl<B: MempoolBlock> Core<B> {
             order: VecDeque::new(),
             queued_transactions: 0,
             payload_maker,
+            shadow_log,
+        }
+    }
+
+    /// Mark a stored payload's requests as in the ordering pipeline.
+    fn mark_pipelined(&self, payload: &Payload) {
+        for tx in &payload.transactions {
+            if let Some(seq) = tx_seq(tx) {
+                self.shadow_log.mark_pipelined(seq);
+            }
         }
     }
 
@@ -169,19 +187,25 @@ impl<B: MempoolBlock> Core<B> {
         // before the clients' request timeout anyway. The payload is
         // dropped before it is stored or broadcast; peers' payloads are
         // never shed here.
-        ensure!(
-            self.queued_transactions < self.parameters.max_queued_transactions,
-            MempoolError::MempoolFull
-        );
         // The age bound is the load-independent one: whatever we add now
         // waits at least as long as the current oldest payload has.
-        ensure!(
-            self.queue_age() <= Duration::from_millis(self.parameters.max_queue_delay),
-            MempoolError::MempoolFull
-        );
+        let shed = self.queued_transactions >= self.parameters.max_queued_transactions
+            || self.queue_age() > Duration::from_millis(self.parameters.max_queue_delay);
+        if shed {
+            // The shed transactions will never commit from here: drop their
+            // entries so the client's retry is re-ingested as fresh instead
+            // of deduplicated, and the pending gauge stays honest.
+            for tx in &payload.transactions {
+                if let Some(seq) = tx_seq(tx) {
+                    self.shadow_log.remove(seq);
+                }
+            }
+            return Err(MempoolError::MempoolFull);
+        }
 
         let transactions = payload.transactions.len();
         let digest = payload.digest();
+        self.mark_pipelined(&payload);
         self.process_own_payload(&digest, payload).await?;
         self.queue_insert(digest, transactions);
         Ok(())
@@ -210,6 +234,7 @@ impl<B: MempoolBlock> Core<B> {
         // limit to how many payloads they can send us, and we will store them all.
         let transactions = payload.transactions.len();
         self.store_payload(digest.to_vec(), &payload).await;
+        self.mark_pipelined(&payload);
 
         // Add the payload to the queue.
         self.queue_insert(digest, transactions);

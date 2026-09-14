@@ -1,6 +1,9 @@
 use crate::core::MempoolMessage;
 use crate::messages::{Payload, Transaction};
-use adaptive::ack::{tx_seq, tx_tag, AckIndex, ConnId, TX_TAG_SHADOW, TX_TAG_TRACKED};
+use adaptive::ack::{
+    tx_seq, tx_tag, AckIndex, ConnId, TX_TAG_RETRY_REAL, TX_TAG_RETRY_SHADOW, TX_TAG_SHADOW,
+    TX_TAG_TRACKED,
+};
 use adaptive::shadow::ShadowLog;
 use crypto::Hash as _;
 use crypto::{PublicKey, SignatureService};
@@ -56,17 +59,32 @@ impl Runner {
         }
     }
 
-    async fn add(&mut self, conn: ConnId, tx: Transaction) -> Option<Payload> {
-        // Broadcast-mode client-latency observation: a shadow copy only
-        // stamps the arrival and is never sealed; a tracked real
-        // transaction stamps the arrival and then goes the normal way.
-        // Both carry globally unique seqs (see the client's lane striping).
+    async fn add(&mut self, conn: ConnId, mut tx: Transaction) -> Option<Payload> {
+        // Broadcast-mode per-request bookkeeping (globally unique seqs, see
+        // the client's lane striping): shadow copies stamp the arrival and
+        // are never sealed; a tracked real transaction seals unless this
+        // replica already sealed that seq. A retried real copy (the
+        // client's retransmission) seals only if the request is not already
+        // in the ordering pipeline anywhere.
         match (tx_tag(&tx), tx_seq(&tx)) {
-            (Some(TX_TAG_SHADOW), Some(seq)) => {
-                self.shadow_log.record(seq);
+            (Some(TX_TAG_SHADOW) | Some(TX_TAG_RETRY_SHADOW), Some(seq)) => {
+                self.shadow_log.record_shadow(seq, conn);
                 return None;
             }
-            (Some(TX_TAG_TRACKED), Some(seq)) => self.shadow_log.record(seq),
+            (Some(TX_TAG_TRACKED), Some(seq)) => {
+                if !self.shadow_log.record_real(seq, conn) {
+                    debug!("dropping duplicate tracked transaction {}", seq);
+                    return None;
+                }
+            }
+            (Some(TX_TAG_RETRY_REAL), Some(seq)) => {
+                if !self.shadow_log.record_retry_real(seq, conn) {
+                    debug!("dropping retried transaction {}: already in the pipeline", seq);
+                    return None;
+                }
+                // Sealed as an ordinary tracked transaction from here on.
+                tx[0] = TX_TAG_TRACKED;
+            }
             _ => {}
         }
         let length = tx.len();
@@ -103,8 +121,8 @@ impl Runner {
 
     async fn run(&mut self) {
         // Periodic sealing bounds how long a transaction can sit unsealed on
-        // a replica that is not currently proposing (PBFT followers never
-        // pull payloads on demand; they only broadcast sealed ones).
+        // a replica that is not currently proposing (only the proposer pulls
+        // payloads on demand; everyone else only broadcasts sealed ones).
         // min_block_delay == 0 disables the periodic seal, leaving the
         // original pull-only behavior.
         let seal_period = Duration::from_millis(if self.min_block_delay == 0 {

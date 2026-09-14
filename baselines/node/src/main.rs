@@ -31,7 +31,7 @@ async fn main() {
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
-                .args_from_usage("--protocol=[NAME] 'Consensus protocol: hotstuff, pbft, or sbft (default hotstuff)'")
+                .args_from_usage("--protocol=[NAME] 'Consensus protocol: hotstuff (default hotstuff)'")
                 .args_from_usage("--replica-id=[INT] 'Global 0-based id of this replica (default 0)'")
                 .args_from_usage("--replica-map=[FILE] 'replica_map.json mapping public keys to replica ids'")
                 .args_from_usage("--failure-spec=[FILE] 'failure_spec.xml for proposal-delay injection'")

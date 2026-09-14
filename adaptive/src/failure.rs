@@ -1,7 +1,7 @@
 //! Protocol-specific failure injection: the proposal-delay controller, a port
 //! of SmartBFT/examples/smallbank/failure.go. It reads the shared failure-spec
-//! XML (the `<pbft><proposalDelay>` section, or the equivalent section of
-//! another protocol), anchored to the harness-wide `--failure-start-unix-ms`
+//! XML (the `<hotstuff><proposalDelay>` or `<autobahn><proposalDelay>`
+//! section), anchored to the harness-wide `--failure-start-unix-ms`
 //! timestamp, and answers "how long should this replica delay its proposal
 //! right now".
 //!
@@ -30,8 +30,6 @@ pub const LEADER_REPLICA_TOKEN: &str = "leader";
 /// Which protocol section of the spec to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolSection {
-    Pbft,
-    Sbft,
     Hotstuff,
     Autobahn,
 }
@@ -62,8 +60,6 @@ struct PhaseXml {
     #[serde(rename = "atTimeMs")]
     at_time_ms: Option<i64>,
     time: Option<f64>,
-    pbft: Option<ProtocolSectionXml>,
-    sbft: Option<ProtocolSectionXml>,
     hotstuff: Option<ProtocolSectionXml>,
     autobahn: Option<ProtocolSectionXml>,
 }
@@ -158,8 +154,6 @@ impl ProposalDelayController {
         {
             let start = phase_start(&phase);
             let section_xml = match section {
-                ProtocolSection::Pbft => phase.pbft,
-                ProtocolSection::Sbft => phase.sbft,
                 ProtocolSection::Hotstuff => phase.hotstuff,
                 ProtocolSection::Autobahn => phase.autobahn,
             };
@@ -552,32 +546,32 @@ mod tests {
                 <directedEdges>true</directedEdges>
                 <global><delayMs>0</delayMs><burstDurationMs>0</burstDurationMs><burstIntervalMs>0</burstIntervalMs></global>
             </network>
-            <pbft>
+            <hotstuff>
                 <proposalDelay>
                     <replicas></replicas>
                 </proposalDelay>
-            </pbft>
+            </hotstuff>
         </phase>
         <phase>
             <atTime>60</atTime>
-            <pbft>
+            <hotstuff>
                 <proposalDelay>
                     <interval>30</interval>
                     <replicas>
                         <replica><id>leader</id><delayMs>3000</delayMs></replica>
                     </replicas>
                 </proposalDelay>
-            </pbft>
+            </hotstuff>
         </phase>
         <phase>
             <atTime>120</atTime>
-            <pbft>
+            <hotstuff>
                 <proposalDelay>
                     <replicas>
                         <replica><id>2</id><delayMs>500</delayMs></replica>
                     </replicas>
                 </proposalDelay>
-            </pbft>
+            </hotstuff>
         </phase>
     </phases>
 </failureSpec>"#;
@@ -592,12 +586,12 @@ mod tests {
     fn controller_at(offset_from_warmup: Duration) -> ProposalDelayController {
         // Position "now" at warmUp + offset past start.
         let start = now_unix_ms() - 10_000 - offset_from_warmup.as_millis() as u64;
-        ProposalDelayController::load(SPEC, start, ProtocolSection::Pbft).unwrap()
+        ProposalDelayController::load(SPEC, start, ProtocolSection::Hotstuff).unwrap()
     }
 
     #[test]
     fn parses_real_spec_shape() {
-        let ctrl = ProposalDelayController::load(SPEC, now_unix_ms(), ProtocolSection::Pbft).unwrap();
+        let ctrl = ProposalDelayController::load(SPEC, now_unix_ms(), ProtocolSection::Hotstuff).unwrap();
         // Phase 1 repeats every 30s until phase 2 at 120s: entries at 60 and
         // 90, plus phase 0 and phase 2.
         assert_eq!(ctrl.phases.len(), 4);
@@ -617,7 +611,7 @@ mod tests {
     fn warmup_disables_injection() {
         // Now is before warm-up completes.
         let ctrl =
-            ProposalDelayController::load(SPEC, now_unix_ms(), ProtocolSection::Pbft).unwrap();
+            ProposalDelayController::load(SPEC, now_unix_ms(), ProtocolSection::Hotstuff).unwrap();
         let all: Vec<u32> = (0..4).collect();
         assert_eq!(ctrl.delay_for_proposal(0, 0, &all), Duration::ZERO);
     }
@@ -678,12 +672,13 @@ mod tests {
     #[test]
     fn missing_section_yields_no_delays() {
         let ctrl = controller_at(Duration::from_secs(100));
-        // Same instant but reading the sbft section of a pbft-only spec.
+        // Same instant but reading the autobahn section of a hotstuff-only spec.
         let start = now_unix_ms() - 110_000;
-        let sbft = ProposalDelayController::load(SPEC, start, ProtocolSection::Sbft).unwrap();
+        let autobahn =
+            ProposalDelayController::load(SPEC, start, ProtocolSection::Autobahn).unwrap();
         let all: Vec<u32> = (0..4).collect();
-        assert_eq!(sbft.delay_for_proposal(1, 1, &all), Duration::ZERO);
-        // Sanity: the pbft view of the same time window does delay.
+        assert_eq!(autobahn.delay_for_proposal(1, 1, &all), Duration::ZERO);
+        // Sanity: the hotstuff view of the same time window does delay.
         assert_ne!(ctrl.delay_for_proposal(1, 1, &all), Duration::ZERO);
     }
 }

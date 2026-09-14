@@ -1,15 +1,11 @@
 use crate::config::Export as _;
-use crate::config::{
-    Committee, Parameters, PbftCommittee, PbftParameters, SbftCommittee, SbftParameters, Secret,
-};
+use crate::config::{Committee, Parameters, Secret};
 use adaptive::ack::{encode_leader_hint, tx_seq, AckIndex, AckRouter};
 use adaptive::shadow::ShadowLog;
-use adaptive::episode::{
-    hotstuff_hooks, pbft_hooks, sbft_hooks, LearningConfig, LearningManager, ProtocolHooks,
-};
+use adaptive::episode::{hotstuff_hooks, LearningConfig, LearningManager, ProtocolHooks};
 use adaptive::failure::{ProposalDelayController, ProtocolSection};
 use adaptive::metrics::LearningSample;
-use adaptive::timeouts::{SbftTimeoutCells, TimeoutCell};
+use adaptive::timeouts::TimeoutCell;
 use crypto::{Digest, PublicKey, SignatureService};
 use hotstuff::ConsensusError;
 use log::{info, warn};
@@ -50,12 +46,6 @@ pub enum NodeError {
     ConsensusError(#[from] ConsensusError),
 
     #[error(transparent)]
-    PbftError(#[from] pbft::PbftError),
-
-    #[error(transparent)]
-    SbftError(#[from] sbft::SbftError),
-
-    #[error(transparent)]
     MempoolError(#[from] MempoolError),
 
     #[error("Adaptive-timer setup error: {0}")]
@@ -65,20 +55,13 @@ pub enum NodeError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolKind {
     Hotstuff,
-    Pbft,
-    Sbft,
 }
 
 impl ProtocolKind {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "hotstuff" => Ok(Self::Hotstuff),
-            "pbft" => Ok(Self::Pbft),
-            "sbft" => Ok(Self::Sbft),
-            other => Err(format!(
-                "unknown protocol {:?}; expected hotstuff, pbft, or sbft",
-                other
-            )),
+            other => Err(format!("unknown protocol {:?}; expected hotstuff", other)),
         }
     }
 }
@@ -112,9 +95,8 @@ pub struct AdaptiveOptions {
 /// by the shared analyze loop (acks + learning samples).
 pub struct Delivered {
     pub sequence: u64,
-    /// What the learning sample's `view` should be: PBFT reports its real
-    /// view (regency), batched HotStuff reports a cumulative round-gap
-    /// counter (see the adapter).
+    /// What the learning sample's `view` should be: batched HotStuff reports
+    /// a cumulative round-gap counter (see the adapter).
     pub sample_view: u64,
     pub leader: PublicKey,
     pub payload: Vec<Digest>,
@@ -146,8 +128,8 @@ pub struct Node {
     learning: Option<Arc<LearningManager>>,
     replica_of: HashMap<PublicKey, u32>,
     /// Stable-leader protocols push leader hints to client connections so a
-    /// leader-targeting client can follow elections. Off for HotStuff (the
-    /// leader rotates every round).
+    /// leader-targeting client can follow elections. Always off here: HotStuff
+    /// rotates the leader every round.
     emit_leader_hints: bool,
 }
 
@@ -198,8 +180,6 @@ impl Node {
         };
         let failure_section = match protocol {
             ProtocolKind::Hotstuff => ProtocolSection::Hotstuff,
-            ProtocolKind::Pbft => ProtocolSection::Pbft,
-            ProtocolKind::Sbft => ProtocolSection::Sbft,
         };
         let proposal_delay = match (&adaptive_opts.failure_spec, adaptive_opts.failure_start_unix_ms)
         {
@@ -301,116 +281,6 @@ impl Node {
                 Self::adapt_hotstuff_commits(rx_commit, tx_delivered);
                 learning
             }
-            ProtocolKind::Pbft => {
-                let committee = PbftCommittee::read(committee_file)?;
-                let parameters = match parameters {
-                    Some(filename) => PbftParameters::read(filename)?,
-                    None => PbftParameters::default(),
-                };
-                let timeout_cell = TimeoutCell::new(Duration::from_millis(
-                    parameters.consensus.timeout_delay,
-                ));
-                let learning = make_learning(pbft_hooks(timeout_cell.clone()))?;
-                let instrumentation = pbft::Instrumentation {
-                    timeout_cell,
-                    learning: learning.clone(),
-                    proposal_delay,
-                    replica_id: adaptive_opts.replica_id,
-                    replica_of: replica_of.clone(),
-                };
-
-                let (tx_commit, rx_commit) = channel(1000);
-                let (tx_consensus, rx_consensus) = channel(1000);
-                let (tx_consensus_mempool, rx_consensus_mempool) = channel(1000);
-                let (tx_mempool_loopback, rx_mempool_loopback) = channel(1000);
-
-                Mempool::run(
-                    name,
-                    committee.mempool,
-                    parameters.mempool,
-                    store.clone(),
-                    signature_service.clone(),
-                    tx_mempool_loopback,
-                    rx_consensus_mempool,
-                    Arc::clone(&ack_index),
-                    Arc::clone(&ack_router),
-                    Arc::clone(&shadow_log),
-                )?;
-
-                pbft::Consensus::run(
-                    name,
-                    committee.consensus,
-                    parameters.consensus,
-                    store.clone(),
-                    signature_service,
-                    tx_consensus,
-                    rx_consensus,
-                    tx_consensus_mempool,
-                    rx_mempool_loopback,
-                    tx_commit,
-                    instrumentation,
-                )
-                .await?;
-
-                Self::adapt_pbft_commits(rx_commit, tx_delivered);
-                learning
-            }
-            ProtocolKind::Sbft => {
-                let committee = SbftCommittee::read(committee_file)?;
-                let parameters = match parameters {
-                    Some(filename) => SbftParameters::read(filename)?,
-                    None => SbftParameters::default(),
-                };
-                let timeout_cells = SbftTimeoutCells::new(
-                    Duration::from_millis(parameters.consensus.timeout_delay),
-                    Duration::from_millis(parameters.consensus.slow_path_timeout),
-                    Duration::from_millis(parameters.consensus.batch_timeout),
-                );
-                let learning = make_learning(sbft_hooks(timeout_cells.clone()))?;
-                let instrumentation = sbft::Instrumentation {
-                    timeout_cells,
-                    learning: learning.clone(),
-                    proposal_delay,
-                    replica_id: adaptive_opts.replica_id,
-                    replica_of: replica_of.clone(),
-                };
-
-                let (tx_commit, rx_commit) = channel(1000);
-                let (tx_consensus, rx_consensus) = channel(1000);
-                let (tx_consensus_mempool, rx_consensus_mempool) = channel(1000);
-                let (tx_mempool_loopback, rx_mempool_loopback) = channel(1000);
-
-                Mempool::run(
-                    name,
-                    committee.mempool,
-                    parameters.mempool,
-                    store.clone(),
-                    signature_service.clone(),
-                    tx_mempool_loopback,
-                    rx_consensus_mempool,
-                    Arc::clone(&ack_index),
-                    Arc::clone(&ack_router),
-                    Arc::clone(&shadow_log),
-                )?;
-
-                sbft::Consensus::run(
-                    name,
-                    committee.consensus,
-                    parameters.consensus,
-                    store.clone(),
-                    signature_service,
-                    tx_consensus,
-                    rx_consensus,
-                    tx_consensus_mempool,
-                    rx_mempool_loopback,
-                    tx_commit,
-                    instrumentation,
-                )
-                .await?;
-
-                Self::adapt_sbft_commits(rx_commit, tx_delivered);
-                learning
-            }
         };
 
         info!("Node {} successfully booted", name);
@@ -424,7 +294,7 @@ impl Node {
             shadow_latency_announced: false,
             learning,
             replica_of,
-            emit_leader_hints: matches!(protocol, ProtocolKind::Pbft | ProtocolKind::Sbft),
+            emit_leader_hints: false,
         })
     }
 
@@ -517,54 +387,6 @@ impl Node {
         });
     }
 
-    /// PBFT: the sample view is the real view, matching SmartBFT's regency
-    /// semantics.
-    fn adapt_pbft_commits(
-        mut rx_commit: Receiver<pbft::CommittedBatch>,
-        tx_delivered: Sender<Delivered>,
-    ) {
-        tokio::spawn(async move {
-            while let Some(committed) = rx_commit.recv().await {
-                let delivered = Delivered {
-                    sequence: committed.seq,
-                    sample_view: committed.view,
-                    leader: committed.leader,
-                    payload: committed.payload,
-                    first_seen: committed.first_seen,
-                    committed_at: committed.committed_at,
-                    leader_hint: Some((committed.current_view, committed.current_leader)),
-                };
-                if tx_delivered.send(delivered).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    /// SBFT: like PBFT, the sample view is the real view (regency
-    /// semantics).
-    fn adapt_sbft_commits(
-        mut rx_commit: Receiver<sbft::CommittedBatch>,
-        tx_delivered: Sender<Delivered>,
-    ) {
-        tokio::spawn(async move {
-            while let Some(committed) = rx_commit.recv().await {
-                let delivered = Delivered {
-                    sequence: committed.seq,
-                    sample_view: committed.view,
-                    leader: committed.leader,
-                    payload: committed.payload,
-                    first_seen: committed.first_seen,
-                    committed_at: committed.committed_at,
-                    leader_hint: Some((committed.current_view, committed.current_leader)),
-                };
-                if tx_delivered.send(delivered).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
     pub fn print_key_file(filename: &str) -> Result<(), NodeError> {
         Secret::new().write(filename)
     }
@@ -606,6 +428,7 @@ impl Node {
             let shadow_active = !self.shadow_log.is_empty();
             let mut tx_count = 0usize;
             let mut resolved: Vec<Duration> = Vec::new();
+            let mut shadow_acks: Vec<(adaptive::ack::ConnId, u64)> = Vec::new();
             if self.learning.is_some() || shadow_active {
                 for digest in &delivered.payload {
                     match self.store.read(digest.to_vec()).await {
@@ -614,14 +437,14 @@ impl Node {
                                 tx_count += payload.transactions.len();
                                 if shadow_active {
                                     for tx in &payload.transactions {
-                                        if let Some(arrival) =
-                                            tx_seq(tx).and_then(|seq| self.shadow_log.take(seq))
-                                        {
+                                        let Some(seq) = tx_seq(tx) else { continue };
+                                        if let Some((conn, arrival)) = self.shadow_log.take(seq) {
                                             resolved.push(
                                                 delivered
                                                     .committed_at
                                                     .saturating_duration_since(arrival),
                                             );
+                                            shadow_acks.push((conn, seq));
                                         }
                                     }
                                 }
@@ -632,6 +455,14 @@ impl Node {
                         Err(e) => warn!("Failed to read committed payload: {}", e),
                     }
                 }
+            }
+            // Replicas-reply-to-client: every replica that
+            // saw a request's broadcast acks it on its own client connection
+            // at commit, so a request sealed by a since-dead ingester, or
+            // re-sealed elsewhere after a retry, is still acked. The client
+            // dedups.
+            if !shadow_acks.is_empty() {
+                self.ack_router.ack(&shadow_acks);
             }
             if !resolved.is_empty() {
                 self.shadow_samples

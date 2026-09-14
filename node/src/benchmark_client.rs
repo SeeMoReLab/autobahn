@@ -13,6 +13,7 @@ async fn main() -> Result<()> {
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The total rate (txs/s), split across targets'")
         .args_from_usage("--request-timeout=<INT> 'Unacked transactions count as errors after this many ms'")
+        .args_from_usage("--retry-timeout=[INT] 'Broadcast mode: re-broadcast an unacked transaction after this many ms, doubling per retry (default 1000)'")
         .args_from_usage("--target-mode=[MODE] 'spread: split rate across all replicas (default); leader: send everything to the current leader, following leader hints'")
         .args_from_usage("--connections-per-target=[INT] 'Parallel connections (independent senders) per replica (default 4)'")
         .args_from_usage("--monitor-interval=[INT] 'Milliseconds between Monitor lines (default 1000)'")
@@ -43,6 +44,12 @@ async fn main() -> Result<()> {
         .parse::<u64>()
         .map(Duration::from_millis)
         .context("The request timeout must be a non-negative integer (ms)")?;
+    let retry_timeout = matches
+        .value_of("retry-timeout")
+        .unwrap_or("1000")
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .context("The retry timeout must be a non-negative integer (ms)")?;
     let monitor_interval = matches
         .value_of("monitor-interval")
         .unwrap_or("1000")
@@ -74,6 +81,7 @@ async fn main() -> Result<()> {
         rate,
         tx_size,
         request_timeout,
+        retry_timeout,
         monitor_interval,
         start_unix_ms,
         duration,

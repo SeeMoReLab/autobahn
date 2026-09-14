@@ -53,20 +53,3 @@ impl AutobahnTimeoutCells {
     }
 }
 
-/// The three SBFT knobs from `SbftTimeout` in agent.proto.
-#[derive(Clone, Debug)]
-pub struct SbftTimeoutCells {
-    pub election: TimeoutCell,
-    pub slow_path: TimeoutCell,
-    pub batch: TimeoutCell,
-}
-
-impl SbftTimeoutCells {
-    pub fn new(election: Duration, slow_path: Duration, batch: Duration) -> Self {
-        Self {
-            election: TimeoutCell::new(election),
-            slow_path: TimeoutCell::new(slow_path),
-            batch: TimeoutCell::new(batch),
-        }
-    }
-}

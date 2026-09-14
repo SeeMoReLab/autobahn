@@ -102,7 +102,7 @@ impl Mempool {
             parameters.max_payload_size,
             parameters.min_block_delay,
             ack_index,
-            shadow_log,
+            Arc::clone(&shadow_log),
             rx_client,
             tx_core,
         );
@@ -118,6 +118,7 @@ impl Mempool {
             /* core_channel */ rx_core,
             consensus_mempool_channel,
             /* network_channel */ tx_network,
+            shadow_log,
         );
         tokio::spawn(async move {
             core.run().await;

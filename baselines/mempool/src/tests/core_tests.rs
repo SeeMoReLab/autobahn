@@ -66,6 +66,7 @@ async fn core(
         /* core_channel */ rx_core,
         /* consensus_channel */ rx_consensus_mempool,
         /* network_channel */ tx_network,
+        Arc::new(adaptive::shadow::ShadowLog::new()),
     );
     tokio::spawn(async move {
         core.run().await;

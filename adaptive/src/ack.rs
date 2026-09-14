@@ -41,6 +41,18 @@ pub const TX_TAG_SHADOW: u8 = 2;
 /// replica-side tracking by seq sound.
 pub const TX_TAG_TRACKED: u8 = 3;
 
+/// Tag of a retried real transaction (broadcast client mode): the client
+/// re-broadcasts a transaction unacked for its retry timeout. This full copy
+/// goes to the adopted leader and is sealable unless the request is already
+/// in the ordering pipeline (it re-delivers a request the leader shed or
+/// never had).
+pub const TX_TAG_RETRY_REAL: u8 = 4;
+
+/// Tag of a retried shadow header (broadcast client mode): the
+/// retransmission as seen by every non-leader front. Never sealed; recorded
+/// like a first shadow when the request is unknown to that front.
+pub const TX_TAG_RETRY_SHADOW: u8 = 5;
+
 /// The tag byte of a transaction; None if it is too short to carry one.
 pub fn tx_tag(tx: &[u8]) -> Option<u8> {
     tx.first().copied()

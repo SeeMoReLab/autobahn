@@ -23,13 +23,11 @@ anyhow = "1.0.38"
 crypto = { path = "../crypto" }
 store = { path = "../store" }
 hotstuff = { path = "../hotstuff" }
-pbft = { path = "../pbft" }
-sbft = { path = "../sbft" }
 mempool = { path = "../mempool" }
 adaptive = { path = "../../adaptive" }
 
 [features]
-benchmark = ["hotstuff/benchmark", "pbft/benchmark", "sbft/benchmark", "mempool/benchmark"]
+benchmark = ["hotstuff/benchmark", "mempool/benchmark"]
 
 [[bin]]         
 name = "client"   

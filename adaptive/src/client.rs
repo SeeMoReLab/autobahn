@@ -11,15 +11,16 @@
 //! `monitor_interval`.
 
 use crate::ack::{
-    decode_ack_frame, decode_leader_hint, TX_HEADER_BYTES, TX_TAG_REAL, TX_TAG_SHADOW,
-    TX_TAG_TRACKED,
+    decode_ack_frame, decode_leader_hint, TX_HEADER_BYTES, TX_TAG_REAL, TX_TAG_RETRY_REAL,
+    TX_TAG_RETRY_SHADOW, TX_TAG_SHADOW, TX_TAG_TRACKED,
 };
 use crate::monitor::{diff_snapshot, format_results, BenchmarkMetrics, MetricsSnapshot};
 use crate::timestamped_log_tag;
 use anyhow::{bail, Context, Result};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,22 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const CONNECT_RETRY: Duration = Duration::from_millis(200);
 const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+/// Sender pacing frequency: each lane sends its allotment this many times
+/// per second.
+const PRECISION: u64 = 20;
+/// Floor on retransmissions per lane per pacing tick, so low-rate runs
+/// still retransmit promptly.
+const RETRY_BATCH_FLOOR: usize = 100;
+/// Retransmission budget per lane per tick, as a multiple of that lane's
+/// submission burst. At 1x, retries can exactly keep pace with requests
+/// newly coming due; the margin above that is what drains the backlog a
+/// stall builds up. A fixed cap below the offered rate makes the repair
+/// path permanently slower than the damage path (seen live: retries pinned
+/// at the cap for minutes while the pending backlog grew without bound).
+const RETRY_BURST_FACTOR: f64 = 2.0;
+/// Retransmissions per transaction before giving up (the request timeout
+/// usually ends them first: the backoff doubles per attempt).
+const MAX_RETRIES: u32 = 6;
 
 type TxSink = futures::stream::SplitSink<Framed<TcpStream, LengthDelimitedCodec>, bytes::Bytes>;
 type TxStream = futures::stream::SplitStream<Framed<TcpStream, LengthDelimitedCodec>>;
@@ -40,13 +57,13 @@ pub enum TargetMode {
     /// default; ingestion is leader-agnostic).
     Spread,
     /// The full rate goes to the current consensus leader's front, following
-    /// the leader hints replicas push on the ack connections (classical
-    /// PBFT-style submission; the leader batches everything, as in the
-    /// SmartBFT baseline). Only meaningful for stable-leader protocols.
+    /// the leader hints replicas push on the ack connections (the leader
+    /// batches everything, as in the SmartBFT baseline). Only meaningful for
+    /// stable-leader protocols.
     Leader,
     /// Like `Leader` for the real transaction stream, but every other front
     /// additionally receives the 9-byte header of each transaction as a
-    /// shadow copy (classical PBFT client broadcast). Followers timestamp
+    /// shadow copy. Followers timestamp
     /// the shadow arrivals, giving every replica a local, leader-independent
     /// measure of client-perceived latency. Only meaningful for
     /// stable-leader protocols.
@@ -90,6 +107,10 @@ pub struct ClientConfig {
     pub tx_size: usize,
     /// A transaction unacked for this long counts as an error.
     pub request_timeout: Duration,
+    /// Broadcast mode: a transaction unacked for this long is re-broadcast
+    /// (doubling per retry), re-delivering it to a leader that shed or
+    /// never received it.
+    pub retry_timeout: Duration,
     /// Cadence of the Monitor line.
     pub monitor_interval: Duration,
     /// Epoch ms at which to start submitting (the harness-wide synchronized
@@ -202,13 +223,14 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
     }
 
     client_println!(
-        "targets={:?} target_mode={:?} connections_per_target={} rate={} tx_size={} request_timeout_ms={} monitor_interval_ms={}",
+        "targets={:?} target_mode={:?} connections_per_target={} rate={} tx_size={} request_timeout_ms={} retry_timeout_ms={} monitor_interval_ms={}",
         cfg.targets,
         cfg.target_mode,
         cfg.connections_per_target,
         cfg.rate,
         cfg.tx_size,
         cfg.request_timeout.as_millis(),
+        cfg.retry_timeout.as_millis(),
         cfg.monitor_interval.as_millis()
     );
 
@@ -297,6 +319,14 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
             // shadow header everywhere else. Acks for a lane's transactions
             // arrive on whichever of the lane's connections ingested them,
             // so the outstanding map is shared per lane, not per connection.
+            let per_tick = retry_limit_per_tick(per_sender_rate);
+            client_println!(
+                "Broadcast mode: retry timeout {} ms, retransmission budget {}/lane/tick ({}/s across {} lanes)",
+                cfg.retry_timeout.as_millis(),
+                per_tick,
+                per_tick * PRECISION as usize * cfg.connections_per_target,
+                cfg.connections_per_target
+            );
             let mut slots: Vec<Option<_>> = connections.into_iter().map(Some).collect();
             for lane in 0..cfg.connections_per_target {
                 let outstanding: Arc<Mutex<HashMap<u64, Instant>>> =
@@ -324,8 +354,11 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
                     lane,
                     per_sender_rate,
                     cfg.tx_size,
+                    cfg.retry_timeout,
+                    cfg.request_timeout,
                     Arc::clone(&leader_index),
                     Arc::clone(&outstanding),
+                    Arc::clone(&metrics),
                 )));
                 tasks.push(tokio::spawn(sweeper(
                     cfg.request_timeout,
@@ -419,7 +452,6 @@ async fn sender(
     outstanding: Arc<Mutex<HashMap<u64, Instant>>>,
     metrics: Arc<BenchmarkMetrics>,
 ) {
-    const PRECISION: u64 = 20; // pacing ticks per second
     let tick_period = Duration::from_millis(1000 / PRECISION);
     let mut interval = tokio::time::interval(tick_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
@@ -483,9 +515,16 @@ async fn sender(
 /// sender; per transaction, the real (tracked) copy is fed to the adopted
 /// leader's sink and the 9-byte shadow header to every other front, with one
 /// flush per sink per burst. A failed shadow sink is dropped (that front
-/// simply stops observing this lane); a failed leader sink ends the lane,
-/// like the plain sender - its outstanding transactions surface as errors
-/// via the sweeper.
+/// simply stops observing this lane); a failed leader sink holds the lane
+/// until the hint quorum moves to a live front.
+///
+/// Retries: a transaction unacked for `retry_timeout` is re-broadcast - a
+/// sealable retry copy to the adopted leader, a retry shadow header
+/// everywhere else - so a request the leader shed or never received is
+/// re-delivered. Retries back off exponentially, stop at
+/// `request_timeout` (when the sweeper counts the transaction as an
+/// error), and are paced per tick so a stall cannot turn into a retry
+/// storm.
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_sender(
     mut sinks: Vec<Option<TxSink>>,
@@ -493,10 +532,12 @@ async fn broadcast_sender(
     lane: usize,
     rate: f64,
     tx_size: usize,
+    retry_timeout: Duration,
+    request_timeout: Duration,
     leader_index: Arc<AtomicUsize>,
     outstanding: Arc<Mutex<HashMap<u64, Instant>>>,
+    metrics: Arc<BenchmarkMetrics>,
 ) {
-    const PRECISION: u64 = 20; // pacing ticks per second
     let tick_period = Duration::from_millis(1000 / PRECISION);
     let mut interval = tokio::time::interval(tick_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
@@ -505,86 +546,87 @@ async fn broadcast_sender(
     // Credit accumulator, as in Leader mode: no burst of the missed
     // allowance after an inactive stretch.
     let mut credit: f64 = 0.0;
+    // Retransmission schedule: (due, seq, attempt), earliest first. Acked
+    // transactions are skipped when they come due.
+    let mut retries: BinaryHeap<Reverse<(Instant, u64, u32)>> = BinaryHeap::new();
+    let retry_limit = retry_limit_per_tick(rate);
     loop {
         interval.tick().await;
         let tick_start = Instant::now();
         let adopted = leader_index.load(Ordering::Relaxed);
-        if adopted >= sinks.len() {
+        let leader_ready = adopted < sinks.len() && sinks[adopted].is_some();
+        let burst = if leader_ready {
+            credit += rate / PRECISION as f64;
+            let burst = credit as u64;
+            credit -= burst as f64;
+            burst
+        } else {
+            // No adopted leader yet, or its connection is gone (it likely
+            // died as leader): hold new submissions - without accruing
+            // credit - until the hint quorum moves to a live front. Retries
+            // below still go out to the live fronts.
             credit = 0.0;
-            continue;
-        }
-        if sinks[adopted].is_none() {
-            client_println!(
-                "lane {}: connection to adopted leader {} is gone; lane stops",
-                lane,
-                targets[adopted]
-            );
-            return;
-        }
-        credit += rate / PRECISION as f64;
-        let burst = credit as u64;
-        credit -= burst as f64;
+            0
+        };
 
         for _ in 0..burst {
             counter += 1;
             let seq = ((lane as u64) << LANE_SHIFT) | counter;
-            let mut shadow = BytesMut::with_capacity(TX_HEADER_BYTES);
-            shadow.put_u8(TX_TAG_SHADOW);
-            shadow.put_u64(seq);
-            let shadow = shadow.freeze();
-            let mut tx = BytesMut::with_capacity(tx_size);
-            tx.put_u8(TX_TAG_TRACKED);
-            tx.put_u64(seq);
-            tx.resize(tx_size, 0u8);
-            outstanding.lock().unwrap().insert(seq, Instant::now());
-            // Shadows are fed before the real copy so a follower's arrival
-            // stamp is never later than the leader's ingest.
-            for front in 0..sinks.len() {
-                if front == adopted {
-                    continue;
-                }
-                if let Some(sink) = sinks[front].as_mut() {
-                    if let Err(err) = sink.feed(shadow.clone()).await {
-                        client_println!(
-                            "lane {}: shadow stream to {} failed: {}; front dropped from shadowing",
-                            lane,
-                            targets[front],
-                            err
-                        );
-                        sinks[front] = None;
-                    }
-                }
-            }
-            let sink = sinks[adopted].as_mut().expect("checked at tick start");
-            if let Err(err) = sink.feed(tx.freeze()).await {
-                client_println!(
-                    "lane {}: connection to leader {} failed: {}",
-                    lane,
-                    targets[adopted],
-                    err
-                );
-                return;
+            outstanding.lock().unwrap().insert(seq, tick_start);
+            retries.push(Reverse((tick_start + retry_timeout, seq, 1)));
+            let shadow = tx_bytes(TX_TAG_SHADOW, seq, TX_HEADER_BYTES);
+            let real = tx_bytes(TX_TAG_TRACKED, seq, tx_size);
+            if !feed_copies(&mut sinks, &targets, lane, adopted, shadow, real).await {
+                break;
             }
         }
-        if burst > 0 {
+
+        let mut retried = 0usize;
+        while retried < retry_limit {
+            let Some(&Reverse((due, seq, attempt))) = retries.peek() else {
+                break;
+            };
+            if due > tick_start {
+                break;
+            }
+            retries.pop();
+            let sent_at = match outstanding.lock().unwrap().get(&seq) {
+                Some(sent_at) => *sent_at,
+                None => continue, // acked meanwhile
+            };
+            if tick_start.duration_since(sent_at) >= request_timeout {
+                continue; // the sweeper is about to count it as an error
+            }
+            retried += 1;
+            metrics.record_retry();
+            let shadow = tx_bytes(TX_TAG_RETRY_SHADOW, seq, TX_HEADER_BYTES);
+            let real = tx_bytes(TX_TAG_RETRY_REAL, seq, tx_size);
+            feed_copies(&mut sinks, &targets, lane, adopted, shadow, real).await;
+            if attempt < MAX_RETRIES {
+                let backoff = retry_timeout.saturating_mul(1u32 << attempt.min(6));
+                retries.push(Reverse((tick_start + backoff, seq, attempt + 1)));
+            }
+        }
+
+        if burst > 0 || retried > 0 {
             for front in 0..sinks.len() {
                 if let Some(sink) = sinks[front].as_mut() {
                     if let Err(err) = sink.flush().await {
                         if front == adopted {
                             client_println!(
-                                "lane {}: connection to leader {} failed: {}",
+                                "lane {}: connection to leader {} lost: {}; holding for a new leader hint",
                                 lane,
                                 targets[adopted],
                                 err
                             );
-                            return;
+                        } else {
+                            client_println!(
+                                "lane {}: shadow stream to {} failed: {}; front dropped from shadowing",
+                                lane,
+                                targets[front],
+                                err
+                            );
                         }
-                        client_println!(
-                            "lane {}: shadow stream to {} failed: {}; front dropped from shadowing",
-                            lane,
-                            targets[front],
-                            err
-                        );
                         sinks[front] = None;
                     }
                 }
@@ -595,6 +637,69 @@ async fn broadcast_sender(
             client_println!("transaction rate too high for this client (lane {})", lane);
         }
     }
+}
+
+/// Retransmissions one lane may send per pacing tick: [`RETRY_BURST_FACTOR`]
+/// times its own submission burst (`rate / precision`), floored at
+/// [`RETRY_BATCH_FLOOR`].
+fn retry_limit_per_tick(rate: f64) -> usize {
+    RETRY_BATCH_FLOOR.max((rate / PRECISION as f64 * RETRY_BURST_FACTOR) as usize)
+}
+
+/// One benchmark transaction: tag byte, big-endian seq, zero padding to
+/// `size` (a 9-byte header when `size` is [`TX_HEADER_BYTES`]).
+fn tx_bytes(tag: u8, seq: u64, size: usize) -> Bytes {
+    let mut tx = BytesMut::with_capacity(size);
+    tx.put_u8(tag);
+    tx.put_u64(seq);
+    tx.resize(size, 0u8);
+    tx.freeze()
+}
+
+/// Feed one transaction's copies for a lane: `real` to the adopted front,
+/// `shadow` to every other live front (shadows first, so a follower's
+/// arrival stamp is never later than the leader's ingest). Returns false if
+/// the adopted front's connection failed - the lane then holds for a new
+/// leader hint; a failed shadow front is dropped from shadowing.
+async fn feed_copies(
+    sinks: &mut [Option<TxSink>],
+    targets: &[SocketAddr],
+    lane: usize,
+    adopted: usize,
+    shadow: Bytes,
+    real: Bytes,
+) -> bool {
+    for front in 0..sinks.len() {
+        if front == adopted {
+            continue;
+        }
+        if let Some(sink) = sinks[front].as_mut() {
+            if let Err(err) = sink.feed(shadow.clone()).await {
+                client_println!(
+                    "lane {}: shadow stream to {} failed: {}; front dropped from shadowing",
+                    lane,
+                    targets[front],
+                    err
+                );
+                sinks[front] = None;
+            }
+        }
+    }
+    if adopted < sinks.len() {
+        if let Some(sink) = sinks[adopted].as_mut() {
+            if let Err(err) = sink.feed(real).await {
+                client_println!(
+                    "lane {}: connection to leader {} lost: {}; holding for a new leader hint",
+                    lane,
+                    targets[adopted],
+                    err
+                );
+                sinks[adopted] = None;
+                return false;
+            }
+        }
+    }
+    true
 }
 
 async fn receiver(
