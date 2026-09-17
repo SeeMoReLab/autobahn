@@ -23,14 +23,14 @@ async fn process_header() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -86,7 +86,6 @@ async fn process_header() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
     // Send a header to the core.
@@ -124,14 +123,14 @@ async fn process_header_missing_parent() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -177,7 +176,6 @@ async fn process_header_missing_parent() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
     let header_one = header();
@@ -206,14 +204,14 @@ async fn process_header_invalid_height() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_parent";
@@ -259,7 +257,6 @@ async fn process_header_invalid_height() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
     // Send a header to the core.
@@ -290,14 +287,14 @@ async fn process_header_missing_payload() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
 
     // Create a new test store.
@@ -344,7 +341,6 @@ async fn process_header_missing_payload() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
     // Send a header to the core.
@@ -373,14 +369,14 @@ async fn process_votes() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
 
     // Create a new test store.
@@ -427,7 +423,6 @@ async fn process_votes() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -483,14 +478,14 @@ async fn process_certificates() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     let(tx_committer, mut rx_committer) = channel(3);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_certificates";
@@ -536,7 +531,6 @@ async fn process_certificates() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -593,14 +587,14 @@ async fn process_prepare() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, _rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -653,7 +647,6 @@ async fn process_prepare() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -723,14 +716,14 @@ async fn generate_confirm() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -783,7 +776,6 @@ async fn generate_confirm() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -869,14 +861,14 @@ async fn generate_commit() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (tx_headers, mut rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     let(tx_committer, mut rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -930,7 +922,6 @@ async fn generate_commit() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -1072,14 +1063,14 @@ async fn generate_pipelined_prepare() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -1132,7 +1123,6 @@ async fn generate_pipelined_prepare() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -1238,14 +1228,14 @@ async fn local_timeout_view() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -1298,7 +1288,6 @@ async fn local_timeout_view() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -1333,7 +1322,7 @@ async fn sync_missing_proposals() {
     let(tx_committer, _rx_committer) = channel(1);
     let(_tx_request_header_sync, rx_request_header_sync) = channel(1);
     let (tx_info, mut rx_info) = channel(1);
-    let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(1);
+    let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -1386,7 +1375,6 @@ async fn sync_missing_proposals() {
         parameters.use_fast_path,
         parameters.fast_path_timeout,
         parameters.use_ride_share,
-        parameters.car_timeout,
     );
 
 
@@ -1484,7 +1472,7 @@ async fn process_special_header() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
@@ -1618,7 +1606,7 @@ async fn process_special_votes() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (tx_headers, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
@@ -1748,7 +1736,7 @@ async fn process_special_certificate() {
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, mut _rx_consensus) = channel(3);

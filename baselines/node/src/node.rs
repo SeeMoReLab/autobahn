@@ -3,7 +3,7 @@ use crate::config::{Committee, Parameters, Secret};
 use adaptive::ack::{encode_leader_hint, tx_seq, AckIndex, AckRouter};
 use adaptive::shadow::ShadowLog;
 use adaptive::episode::{hotstuff_hooks, LearningConfig, LearningManager, ProtocolHooks};
-use adaptive::failure::{ProposalDelayController, ProtocolSection};
+use adaptive::failure::{FaultController, ProtocolSection};
 use adaptive::metrics::LearningSample;
 use adaptive::timeouts::TimeoutCell;
 use crypto::{Digest, PublicKey, SignatureService};
@@ -181,7 +181,7 @@ impl Node {
         let failure_section = match protocol {
             ProtocolKind::Hotstuff => ProtocolSection::Hotstuff,
         };
-        let proposal_delay = match (&adaptive_opts.failure_spec, adaptive_opts.failure_start_unix_ms)
+        let faults = match (&adaptive_opts.failure_spec, adaptive_opts.failure_start_unix_ms)
         {
             (Some(spec), Some(start_ms)) => {
                 if adaptive_opts.replica_map.is_none() {
@@ -190,7 +190,7 @@ impl Node {
                     ));
                 }
                 Arc::new(
-                    ProposalDelayController::load_file(spec, start_ms, failure_section)
+                    FaultController::load_file(spec, start_ms, failure_section)
                         .map_err(|e| NodeError::AdaptiveError(format!("{:#}", e)))?,
                 )
             }
@@ -199,7 +199,7 @@ impl Node {
                     "--failure-spec requires --failure-start-unix-ms".into(),
                 ));
             }
-            _ => Arc::new(ProposalDelayController::disabled()),
+            _ => Arc::new(FaultController::disabled()),
         };
 
         let make_learning = |hooks: ProtocolHooks| -> Result<Option<Arc<LearningManager>>, NodeError> {
@@ -240,7 +240,7 @@ impl Node {
                 let instrumentation = hotstuff::Instrumentation {
                     timeout_cell,
                     learning: learning.clone(),
-                    proposal_delay,
+                    faults,
                     replica_id: adaptive_opts.replica_id,
                     replica_of: replica_of.clone(),
                 };

@@ -440,6 +440,69 @@ async fn wait_for_start(start_unix_ms: Option<u64>) {
     tokio::time::sleep(delay).await;
 }
 
+/// How often a lane reports transactions it could not generate.
+const SHORTFALL_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Paces one lane at `rate` tx/s over the ticks that actually run.
+///
+/// Credit only accrues on executed ticks, so a lane that was blocked in a
+/// write (its front down or saturated) resumes at its nominal rate instead of
+/// replaying the missed allowance in one burst - the ticks it missed are
+/// skipped (`MissedTickBehavior::Skip`) and the shortfall is reported. The
+/// fractional credit keeps the long-run rate exact for rates that do not
+/// divide evenly by the tick frequency.
+struct LanePacer {
+    rate: f64,
+    credit: f64,
+    last_tick: Instant,
+    shortfall: f64,
+    report_at: Instant,
+}
+
+impl LanePacer {
+    fn new(rate: f64) -> Self {
+        let now = Instant::now();
+        Self {
+            rate,
+            credit: 0.0,
+            last_tick: now,
+            shortfall: 0.0,
+            report_at: now + SHORTFALL_REPORT_INTERVAL,
+        }
+    }
+
+    /// Account for the time since the previous tick and return the number of
+    /// transactions to send now.
+    fn tick(&mut self, now: Instant, label: &str) -> u64 {
+        let period = 1.0 / PRECISION as f64;
+        let gap = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
+        if gap > 1.5 * period {
+            self.shortfall += (gap - period) * self.rate;
+        }
+        if self.shortfall >= 1.0 && now >= self.report_at {
+            client_println!(
+                "{} fell behind by {} transactions (blocked or too slow); they were not generated",
+                label,
+                self.shortfall as u64
+            );
+            self.shortfall = 0.0;
+            self.report_at = now + SHORTFALL_REPORT_INTERVAL;
+        }
+        self.credit += self.rate * period;
+        let burst = self.credit as u64;
+        self.credit -= burst as f64;
+        burst
+    }
+
+    /// The lane is deliberately idle (not addressing the current leader):
+    /// no credit and no shortfall accrue.
+    fn idle(&mut self, now: Instant) {
+        self.credit = 0.0;
+        self.last_tick = now;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sender(
     mut sink: TxSink,
@@ -454,39 +517,26 @@ async fn sender(
 ) {
     let tick_period = Duration::from_millis(1000 / PRECISION);
     let mut interval = tokio::time::interval(tick_period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let start = Instant::now();
+    let label = format!("lane to {}", target);
+    let mut pacer = LanePacer::new(rate);
     let mut seq: u64 = 0;
-    let mut sent: u64 = 0;
-    // Leader mode paces with a credit accumulator instead of the absolute
-    // token count: after an inactive stretch the sender must NOT burst the
-    // whole missed allowance at once.
-    let mut credit: f64 = 0.0;
     loop {
         interval.tick().await;
         let tick_start = Instant::now();
-        let burst = match target_mode {
-            TargetMode::Spread => {
-                // Token accounting keeps the long-run rate exact even for
-                // rates that do not divide evenly by the tick frequency.
-                let target_count = (start.elapsed().as_secs_f64() * rate) as u64;
-                target_count.saturating_sub(sent)
-            }
-            TargetMode::Leader => {
-                if leader_index.load(Ordering::Relaxed) != front {
-                    credit = 0.0;
-                    continue;
-                }
-                credit += rate / PRECISION as f64;
-                let burst = credit as u64;
-                credit -= burst as f64;
-                burst
-            }
+        let active = match target_mode {
+            TargetMode::Spread => true,
+            TargetMode::Leader => leader_index.load(Ordering::Relaxed) == front,
             TargetMode::Broadcast => {
                 unreachable!("broadcast mode spawns broadcast_sender, not sender")
             }
         };
+        if !active {
+            pacer.idle(tick_start);
+            continue;
+        }
+        let burst = pacer.tick(tick_start, &label);
 
         for _ in 0..burst {
             seq += 1;
@@ -501,11 +551,6 @@ async fn sender(
                 // counted as errors by the sweeper.
                 return;
             }
-        }
-        sent += burst;
-
-        if tick_start.elapsed() > tick_period {
-            client_println!("transaction rate too high for this client (target {})", target);
         }
         let _ = &metrics; // metrics are recorded by receiver and sweeper
     }
@@ -540,12 +585,11 @@ async fn broadcast_sender(
 ) {
     let tick_period = Duration::from_millis(1000 / PRECISION);
     let mut interval = tokio::time::interval(tick_period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let label = format!("lane {}", lane);
+    let mut pacer = LanePacer::new(rate);
     let mut counter: u64 = 0;
-    // Credit accumulator, as in Leader mode: no burst of the missed
-    // allowance after an inactive stretch.
-    let mut credit: f64 = 0.0;
     // Retransmission schedule: (due, seq, attempt), earliest first. Acked
     // transactions are skipped when they come due.
     let mut retries: BinaryHeap<Reverse<(Instant, u64, u32)>> = BinaryHeap::new();
@@ -556,16 +600,13 @@ async fn broadcast_sender(
         let adopted = leader_index.load(Ordering::Relaxed);
         let leader_ready = adopted < sinks.len() && sinks[adopted].is_some();
         let burst = if leader_ready {
-            credit += rate / PRECISION as f64;
-            let burst = credit as u64;
-            credit -= burst as f64;
-            burst
+            pacer.tick(tick_start, &label)
         } else {
             // No adopted leader yet, or its connection is gone (it likely
             // died as leader): hold new submissions - without accruing
             // credit - until the hint quorum moves to a live front. Retries
             // below still go out to the live fronts.
-            credit = 0.0;
+            pacer.idle(tick_start);
             0
         };
 
@@ -633,9 +674,6 @@ async fn broadcast_sender(
             }
         }
 
-        if tick_start.elapsed() > tick_period {
-            client_println!("transaction rate too high for this client (lane {})", lane);
-        }
     }
 }
 

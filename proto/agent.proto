@@ -12,9 +12,10 @@ enum Protocol {
     PROTOCOL_TENDERMINT = 4;
     PROTOCOL_HOTSTUFF = 5;
     PROTOCOL_AUTOBAHN = 6;
+    PROTOCOL_SMARTBFT = 7;
 }
 
-// PBFT-specific state report.
+// PBFT state report, shared by CppBedrock PBFT/LinearPBFT.
 message PbftReport {
     // Workload size in the learning window.
     uint32 total_transactions = 1;
@@ -43,31 +44,50 @@ message PbftReport {
     float p95_inter_commit_gap_ms = 14;
     uint32 view_change_count = 15;
     uint32 no_progress_view_change_count = 16;
+
+    // Phase-wise latency (milliseconds), reported by CppBedrock PBFT:
+    // pre-prepare arrival -> prepare quorum, prepare quorum -> commit quorum,
+    // commit quorum -> local execution. Zero when the engine does not
+    // measure them (SmartBFT-shaped consumers ignore these fields).
+    float pre_prepare_latency_ms = 17;
+    float prepare_latency_ms = 18;
+    float commit_latency_ms = 19;
 }
 
-// SBFT-specific state report.
-// For now this mirrors PBFT metrics up to leadership dynamics.
+// SBFT state report (CppBedrock SBFT). Fields 1-16 have the same layout and
+// semantics as PbftReport so tooling can treat the two uniformly; the
+// remaining fields carry the SBFT-specific phase and fast/slow-path context.
 message SbftReport {
-    // Workload size in the learning window.
     uint32 total_transactions = 1;
     uint32 total_consensus_instances = 2;
-
-    // End-to-end SBFT consensus latency summaries (milliseconds).
     float avg_consensus_latency_ms = 3;
-    float p95_consensus_latency_ms = 4;
-    float p99_consensus_latency_ms = 5;
-
-    // Throughput and core rates.
+    float p50_consensus_latency_ms = 4;
+    float p95_consensus_latency_ms = 5;
     float throughput_tps = 6;
-    float timeout_violation_rate = 7;
+    float avg_batch_size = 7;
+    float p95_batch_size = 8;
+    uint32 leader_change_count = 9;
+    uint32 regency_change_count = 10;
+    // The election (view-change) timeout in force for this window.
+    uint32 timeout_ms = 11;
+    float avg_inter_commit_gap_ms = 12;
+    float p50_inter_commit_gap_ms = 13;
+    float p95_inter_commit_gap_ms = 14;
+    uint32 view_change_count = 15;
+    uint32 no_progress_view_change_count = 16;
 
-    // Batch characteristics.
-    float avg_batch_size = 8;
-    float p95_batch_size = 9;
+    // Phase-wise latency (milliseconds): pre-prepare arrival -> prepare
+    // quorum, prepare quorum -> commit quorum, commit quorum -> execution.
+    float pre_prepare_latency_ms = 17;
+    float prepare_latency_ms = 18;
+    float commit_latency_ms = 19;
 
-    // Leadership dynamics.
-    uint32 leader_change_count = 10;
-    uint32 regency_change_count = 11;
+    // The slow-path (fast-path wait) timeout in force for this window.
+    uint32 slow_path_timeout_ms = 20;
+    // Consensus instances decided on the fast path versus the slow path in
+    // this window. Zero for both until the engine attributes paths.
+    uint32 fast_path_count = 21;
+    uint32 slow_path_count = 22;
 }
 
 message TendermintReport {
@@ -150,6 +170,28 @@ message AutobahnReport {
     uint32 no_progress_view_change_count = 16;
 }
 
+// SmartBFT state report. Same layout and semantics as PbftReport. SmartBFT is
+// registered as its own protocol so its reward function and schedule can be
+// tuned independently of the Rust PBFT baseline.
+message SmartbftReport {
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+    float avg_consensus_latency_ms = 3;
+    float p50_consensus_latency_ms = 4;
+    float p95_consensus_latency_ms = 5;
+    float throughput_tps = 6;
+    float avg_batch_size = 7;
+    float p95_batch_size = 8;
+    uint32 leader_change_count = 9;
+    uint32 regency_change_count = 10;
+    uint32 timeout_ms = 11;
+    float avg_inter_commit_gap_ms = 12;
+    float p50_inter_commit_gap_ms = 13;
+    float p95_inter_commit_gap_ms = 14;
+    uint32 view_change_count = 15;
+    uint32 no_progress_view_change_count = 16;
+}
+
 // One report from a local node for one episode.
 message ReportLocal {
     reserved 11;
@@ -161,8 +203,8 @@ message ReportLocal {
     // Window end consensus tick (exclusive) used to build this report.
     uint32 report_seq = 7;
     // Number of locally delivered consensus instances in this window.
-    // PBFT uses zero to identify a wall-clock-bounded window; the actual
-    // delivered count remains in PbftReport.total_consensus_instances.
+    // PBFT and SmartBFT use zero to identify a wall-clock-bounded window; the
+    // actual delivered count remains in the report's total_consensus_instances.
     uint32 window_consensus_count = 8;
     oneof state {
         PbftReport pbft_state = 10;
@@ -170,8 +212,11 @@ message ReportLocal {
         TendermintReport tendermint_state = 13;
         HotstuffReport hotstuff_state = 14;
         AutobahnReport autobahn_state = 15;
+        SmartbftReport smartbft_state = 16;
     }
-    optional Reward reward = 4;
+    // Message fields carry presence in proto3, so no `optional` is needed and the
+    // gogo Go generator can consume this file.
+    Reward reward = 4;
     bytes signature = 5;
 }
 
@@ -210,6 +255,13 @@ message AutobahnReward {
     AutobahnTimeout timeout_used = 3;
 }
 
+// SmartBFT action/reward feedback.
+message SmartbftReward {
+    uint32 episode = 1;
+    SmartbftReport report = 2;
+    SmartbftTimeout timeout_used = 3;
+}
+
 // Reward for a prior episode, sent alongside the next report.
 message Reward {
     reserved 2;
@@ -219,6 +271,7 @@ message Reward {
         TendermintReward tendermint = 4;
         HotstuffReward hotstuff = 5;
         AutobahnReward autobahn = 6;
+        SmartbftReward smartbft = 7;
     }
 }
 
@@ -233,10 +286,13 @@ message PbftTimeout {
     uint32 election_timeout_milliseconds = 1;
 }
 
+// CppBedrock SBFT has no leader batching interval, so the timeout carries
+// only the election and slow-path (fast-path wait) knobs.
 message SbftTimeout {
+    reserved 3;
+    reserved "batch_timeout_milliseconds";
     uint32 election_timeout_milliseconds = 1;
     uint32 slow_path_timeout_milliseconds = 2;
-    uint32 batch_timeout_milliseconds = 3;
 }
 
 message TendermintTimeout {
@@ -255,6 +311,10 @@ message AutobahnTimeout {
     uint32 fast_path_timeout_milliseconds = 3;
 }
 
+message SmartbftTimeout {
+    uint32 election_timeout_milliseconds = 1;
+}
+
 // Timeout recommendation.
 message Timeout {
     reserved 2;
@@ -264,6 +324,7 @@ message Timeout {
         TendermintTimeout tendermint = 4;
         HotstuffTimeout hotstuff = 5;
         AutobahnTimeout autobahn = 6;
+        SmartbftTimeout smartbft = 7;
     }
 }
 
@@ -283,7 +344,7 @@ message TimeoutStatus {
     }
     uint32 episode = 1;
     Status status = 2;
-    optional Timeout timeout = 3;
+    Timeout timeout = 3;
     // Echoes the report window selected for this episode.
     uint32 start_tick = 4;
     uint32 report_seq = 5;

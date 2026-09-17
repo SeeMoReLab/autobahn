@@ -13,8 +13,10 @@ use log::{debug, info};
 use std::borrow::BorrowMut;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use log::warn;
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -33,6 +35,10 @@ struct State {
     log: HashMap<Slot, ConsensusMessage>,
     // The last executed slot
     last_executed_slot: Slot,
+    /// When the log first held a commit that could not be executed because an
+    /// earlier slot is missing. Cleared whenever execution advances. Drives the
+    /// catch-up below.
+    stall_since: Option<Instant>,
 }
 
 impl State {
@@ -48,6 +54,7 @@ impl State {
             dag: [(0, genesis)].iter().cloned().collect(),
             log: HashMap::new(),
             last_executed_slot: 0,
+            stall_since: None,
         }
     }
 
@@ -72,6 +79,12 @@ impl State {
 
 pub struct Committer {
     gc_depth: Height,
+    /// How long the committer tolerates a gap in the slot log before it skips
+    /// ahead (see `catch_up`). A healthy replica only sees a gap while a sync
+    /// for the missing slot's proposals is in flight, which resolves within
+    /// a sync retry; a replica that was cut off never receives the missing
+    /// slots at all, because its peers have garbage collected them.
+    catch_up_wait: Duration,
     rx_mempool: Receiver<Certificate>,
     rx_deliver: Receiver<Certificate>,
     rx_commit_message: Receiver<ConsensusMessage>,
@@ -85,6 +98,7 @@ impl Committer {
         committee: Committee,
         store: Store,
         gc_depth: Height,
+        catch_up_wait: Duration,
         rx_mempool: Receiver<Certificate>,
         rx_commit: Receiver<Certificate>,
         rx_commit_message: Receiver<ConsensusMessage>,
@@ -102,6 +116,7 @@ impl Committer {
         tokio::spawn(async move {
             Self {
                 gc_depth,
+                catch_up_wait,
                 rx_mempool,
                 rx_deliver,
                 rx_commit_message,
@@ -115,71 +130,117 @@ impl Committer {
     }
 
     async fn process_commit_message(&mut self, state: &mut State, commit_message: ConsensusMessage) {
-        match commit_message.clone() {
+        match &commit_message {
             ConsensusMessage::Commit{slot, view: _, qc: _, proposals: _} => {
-                if slot <= state.last_executed_slot {
+                if *slot <= state.last_executed_slot {
                     debug!("Already committed slot {}", slot);
                     return;
                 }
-
-                // Store the commit message if all proposals are ready to be processed
-                state.log.insert(slot, commit_message);
-
-                while state.log.contains_key(&(state.last_executed_slot + 1)) {
-                    let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
-                    debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
-                    match current_commit_message {
-                        ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
-                            for (pk, proposal) in proposals {
-                                let stop_height = *state.last_executed_heights.get(pk).unwrap();
-                                // Don't execute proposals which are too old
-                                if proposal.height <= stop_height {
-                                    debug!("skipping this proposal because it's too old");
-                                    continue;
-                                }
-
-                                let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
-                                    .await
-                                    .expect("should have ancestors by now");
-
-                                // Update last executed height for the lane
-                                if proposal.height > stop_height {
-                                    state.last_executed_heights.insert(*pk, proposal.height);
-                                }
-
-                                // Commit all of the headers
-                                for header in headers {
-                                    info!("Committed {}", header);
-                                    #[cfg(feature = "benchmark")]
-                                    for digest in header.payload.keys() {
-                                        // NOTE: This log entry is used to compute performance.
-                                        info!("Committed {} -> {:?}", header, digest);
-                                    }
-                                    debug!("Finished Commit");
-                                    // Output the block to the top-level application.
-                                    if let Err(e) = self.tx_output.send(header.clone()).await {
-                                        debug!("Failed to send block through the output channel: {}", e);
-                                    }
-                                    debug!("Finish upcall");
-                                }
-                            }
-                            state.last_executed_slot += 1;
-                        },
-                        _ => {}
-                    }
-                }
-
+                // Store the commit message; it is executed once every earlier slot has been.
+                state.log.insert(*slot, commit_message);
+                self.execute_ready(state).await;
             },
             _ => {},
         };
+    }
+
+    /// Execute, in slot order, every logged commit whose predecessor has been
+    /// executed. Tracks how long the head of the log has been blocked on a
+    /// missing slot.
+    async fn execute_ready(&mut self, state: &mut State) {
+        while state.log.contains_key(&(state.last_executed_slot + 1)) {
+            let current_commit_message = state.log.remove(&(state.last_executed_slot + 1)).unwrap();
+            debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
+            if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = &current_commit_message {
+                for (pk, proposal) in proposals {
+                    let stop_height = *state.last_executed_heights.get(pk).unwrap();
+                    // Don't execute proposals which are too old
+                    if proposal.height <= stop_height {
+                        debug!("skipping this proposal because it's too old");
+                        continue;
+                    }
+
+                    let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
+                        .await
+                        .expect("should have ancestors by now");
+
+                    // Update last executed height for the lane
+                    state.last_executed_heights.insert(*pk, proposal.height);
+
+                    // Commit all of the headers
+                    for header in headers {
+                        info!("Committed {}", header);
+                        #[cfg(feature = "benchmark")]
+                        for digest in header.payload.keys() {
+                            // Per-digest line (one per batch); debug only to keep logs small.
+                            debug!("Committed {} -> {:?}", header, digest);
+                        }
+                        debug!("Finished Commit");
+                        // Output the block to the top-level application.
+                        if let Err(e) = self.tx_output.send(header.clone()).await {
+                            debug!("Failed to send block through the output channel: {}", e);
+                        }
+                        debug!("Finish upcall");
+                    }
+                }
+            }
+            state.last_executed_slot += 1;
+        }
+        state.stall_since = if state.log.is_empty() { None } else { state.stall_since.or_else(|| Some(Instant::now())) };
+    }
+
+    /// Skip ahead when the log has been blocked on a missing slot for longer
+    /// than `catch_up_wait`. The oldest logged commit is adopted as the new
+    /// position: its per-lane proposals (certified by the CommitQC that
+    /// produced it) become the executed heights, and the missing slots are
+    /// skipped without output. Only the tip headers are needed, and the core
+    /// only forwards a commit once those are stored, so later slots can walk
+    /// their ancestors back to these heights. Anything in the gap was
+    /// committed by the others while this replica was cut off; it cannot be
+    /// replayed because the peers have garbage collected it.
+    async fn catch_up(&mut self, state: &mut State) {
+        let Some(since) = state.stall_since else { return };
+        if since.elapsed() < self.catch_up_wait {
+            return;
+        }
+        let Some(&target) = state.log.keys().min() else { return };
+        if target <= state.last_executed_slot + 1 {
+            return;
+        }
+        let commit_message = state.log.remove(&target).unwrap();
+        if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = &commit_message {
+            let mut adopted = Vec::new();
+            for (pk, proposal) in proposals {
+                let height = state.last_executed_heights.entry(*pk).or_insert(0);
+                *height = max(*height, proposal.height);
+                adopted.push((pk.clone(), *height));
+            }
+            warn!(
+                "Catch-up: slots {}..={} were never received (log blocked for {:?}); adopting slot {} as executed with lane heights {:?}",
+                state.last_executed_slot + 1,
+                target - 1,
+                since.elapsed(),
+                target,
+                adopted
+            );
+        }
+        state.last_executed_slot = target;
+        state.stall_since = None;
+        self.execute_ready(state).await;
     }
 
     async fn run(&mut self) {
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
 
+        let mut catch_up_check = tokio::time::interval(Duration::from_secs(1));
+        catch_up_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = catch_up_check.tick() => {
+                    self.catch_up(state.borrow_mut()).await;
+                },
                 Some(_) = self.rx_mempool.recv() => {
                     // Add the new certificate to the local storage.
                     /*state.dag.entry(certificate.height()).or_insert_with(HashMap::new).insert(

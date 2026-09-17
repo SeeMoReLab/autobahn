@@ -35,19 +35,20 @@ impl TimeoutCell {
     }
 }
 
-/// The three Autobahn knobs from `AutobahnTimeout` in agent.proto.
+/// The two live Autobahn knobs: the per-slot view-change timer and the
+/// fast-path unanimity wait. `AutobahnTimeout` in agent.proto also carries a
+/// `car_timeout_milliseconds` field; nothing in the engine reads it, so it is
+/// neither a cell nor part of the agent's action space.
 #[derive(Clone, Debug)]
 pub struct AutobahnTimeoutCells {
     pub timeout_delay: TimeoutCell,
-    pub car_timeout: TimeoutCell,
     pub fast_path_timeout: TimeoutCell,
 }
 
 impl AutobahnTimeoutCells {
-    pub fn new(timeout_delay: Duration, car_timeout: Duration, fast_path_timeout: Duration) -> Self {
+    pub fn new(timeout_delay: Duration, fast_path_timeout: Duration) -> Self {
         Self {
             timeout_delay: TimeoutCell::new(timeout_delay),
-            car_timeout: TimeoutCell::new(car_timeout),
             fast_path_timeout: TimeoutCell::new(fast_path_timeout),
         }
     }

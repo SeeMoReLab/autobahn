@@ -117,15 +117,17 @@ pub fn hotstuff_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
     }
 }
 
-/// Ready-made hooks for Autobahn: three knobs (timeout_delay, car_timeout,
+/// Ready-made hooks for Autobahn: two knobs (timeout_delay and
 /// fast_path_timeout); `timeout_ms` reports the view-change timeout_delay.
+/// The proto's car_timeout field is sent as 0 and ignored on receipt: the
+/// engine has no timer that reads it.
 pub fn autobahn_hooks(cells: crate::timeouts::AutobahnTimeoutCells) -> ProtocolHooks {
     let as_ms = |cell: &crate::timeouts::TimeoutCell| {
         cell.get().as_millis().min(u32::MAX as u128) as u32
     };
     let initial = pb::AutobahnTimeout {
         timeout_delay_milliseconds: as_ms(&cells.timeout_delay),
-        car_timeout_milliseconds: as_ms(&cells.car_timeout),
+        car_timeout_milliseconds: 0,
         fast_path_timeout_milliseconds: as_ms(&cells.fast_path_timeout),
     };
     let apply_cells = cells.clone();
@@ -148,18 +150,12 @@ pub fn autobahn_hooks(cells: crate::timeouts::AutobahnTimeoutCells) -> ProtocolH
         }),
         apply_timeout: Box::new(move |value| match value {
             pb::timeout::Value::Autobahn(t) => {
-                if t.timeout_delay_milliseconds == 0
-                    || t.car_timeout_milliseconds == 0
-                    || t.fast_path_timeout_milliseconds == 0
-                {
+                if t.timeout_delay_milliseconds == 0 || t.fast_path_timeout_milliseconds == 0 {
                     bail!("non-positive Autobahn timeout component: {:?}", t);
                 }
                 apply_cells
                     .timeout_delay
                     .set(Duration::from_millis(t.timeout_delay_milliseconds as u64));
-                apply_cells
-                    .car_timeout
-                    .set(Duration::from_millis(t.car_timeout_milliseconds as u64));
                 apply_cells
                     .fast_path_timeout
                     .set(Duration::from_millis(t.fast_path_timeout_milliseconds as u64));

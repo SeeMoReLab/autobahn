@@ -92,7 +92,6 @@ pub struct Parameters {
     pub fast_path_timeout: u64,
 
     pub use_ride_share: bool,
-    pub car_timeout: u64,
 
     //asynchrony simulation:
     pub simulate_asynchrony: bool,
@@ -119,7 +118,6 @@ impl Default for Parameters {
             use_fast_path: true,
             fast_path_timeout: 500,
             use_ride_share: false,
-            car_timeout: 2000,
 
             //Async simulation:
             simulate_asynchrony: false,
@@ -146,7 +144,7 @@ impl Parameters {
         info!("Fast path enabled? {}. Fast timeout: {}", self.use_fast_path, self.fast_path_timeout);
         info!("Optimistic tips enabled? {}", self.use_optimistic_tips);
         info!("Parallel Proposals enabled? {}. K: {}", self.use_parallel_proposals, self.k);
-        info!("Ride share enabled? {}. Car timeout: {}", self.use_ride_share, self.car_timeout);
+        info!("Ride share enabled? {}", self.use_ride_share);
     }
 }
 

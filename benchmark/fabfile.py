@@ -43,7 +43,6 @@ def local(ctx, debug=True):
         'use_fast_path': True,
         'fast_path_timeout': 5_000,
         'use_ride_share': False,
-        'car_timeout': 5_000,
 
         'simulate_asynchrony': False,
         'asynchrony_start': 15_000, #ms
@@ -144,7 +143,6 @@ def remote(ctx, debug=True):
         'use_fast_path': True,
         'fast_path_timeout': 5_000,
         'use_ride_share': False,
-        'car_timeout': 5_000,
 
         'simulate_asynchrony': False,
         'asynchrony_start': 15_000, #ms

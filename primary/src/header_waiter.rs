@@ -14,16 +14,24 @@ use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender, UnboundedSender};
 use tokio::time::{sleep, Duration, Instant};
 
 /// The resolution of the timer that checks whether we received replies to our sync requests, and triggers
 /// new sync requests if we didn't.
 const TIMER_RESOLUTION: u64 = 1_000;
+
+/// A pending sync request is abandoned after this many sync retry delays.
+const SYNC_EXPIRY_RETRIES: u128 = 6;
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Failed to measure time")
+        .as_millis()
+}
 
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
@@ -44,21 +52,22 @@ pub struct HeaderWaiter {
     committee: Committee,
     /// The persistent storage.
     store: Store,
-    /// The current consensus round (used for cleanup).
-    consensus_round: Arc<AtomicU64>,
-    /// The depth of the garbage collector.
-    gc_depth: Height,
     /// The delay to wait before re-trying sync requests.
     sync_retry_delay: u64,
+    /// Pending sync requests older than this (ms) are abandoned. Age based,
+    /// not round based: Autobahn lanes are independent, so a header's height
+    /// says nothing about how long its sync has been waiting, and a global
+    /// round cut off every request for a lane that had fallen behind.
+    sync_expiry_ms: u128,
     /// Determine with how many nodes to sync when re-trying to send sync-request.
     sync_retry_nodes: usize,
 
     /// Receives sync commands from the `Synchronizer`.
     rx_synchronizer: Receiver<WaiterMessage>,
     /// Loops back to the core headers for which we got all parents and batches.
-    tx_core: Sender<Header>,
+    tx_core: UnboundedSender<Header>,
     /// Loops back commit messages to the committer for reprocessing
-    tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
+    tx_consensus_loopback: UnboundedSender<(ConsensusMessage, Header)>,
 
     /// Network driver allowing to send messages.
     network: SimpleSender,
@@ -70,10 +79,10 @@ pub struct HeaderWaiter {
     header_requests: HashMap<Digest, (Height, u128)>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
-    batch_requests: HashMap<Digest, Height>,
+    batch_requests: HashMap<Digest, u128>,
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
-    pending: HashMap<Digest, (Height, Sender<()>)>,
+    pending: HashMap<Digest, (u128, Sender<()>)>,
 }
 
 impl HeaderWaiter {
@@ -82,22 +91,19 @@ impl HeaderWaiter {
         name: PublicKey,
         committee: Committee,
         store: Store,
-        consensus_round: Arc<AtomicU64>,
-        gc_depth: Height,
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_synchronizer: Receiver<WaiterMessage>,
-        tx_core: Sender<Header>,
-        tx_consensus_loopback: Sender<(ConsensusMessage, Header)>,
+        tx_core: UnboundedSender<Header>,
+        tx_consensus_loopback: UnboundedSender<(ConsensusMessage, Header)>,
     ) {
         tokio::spawn(async move {
             Self {
                 name,
                 committee,
                 store,
-                consensus_round,
-                gc_depth,
                 sync_retry_delay,
+                sync_expiry_ms: (sync_retry_delay as u128) * SYNC_EXPIRY_RETRIES,
                 sync_retry_nodes,
                 rx_synchronizer,
                 tx_core,
@@ -183,7 +189,7 @@ impl HeaderWaiter {
                                 })
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (round, tx_cancel));
+                            self.pending.insert(header_id, (now_ms(), tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
@@ -193,7 +199,7 @@ impl HeaderWaiter {
                                 for (digest, worker_id) in missing.into_iter() {
                                     self.batch_requests.entry(digest.clone()).or_insert_with(|| {
                                         requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
-                                        round
+                                        now_ms()
                                     });
                                 }
                                 for (worker_id, digests) in requires_sync {
@@ -253,7 +259,7 @@ impl HeaderWaiter {
                             let mut wait_for = Vec::new();
                             wait_for.push((missing.to_vec(), self.store.clone()));
                             let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (height, tx_cancel));
+                            self.pending.insert(header_id, (now_ms(), tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
@@ -301,7 +307,7 @@ impl HeaderWaiter {
                                 .map(|x| (x.header_digest.to_vec(), self.store.clone()))
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(id, (height, tx_cancel));
+                            self.pending.insert(id, (now_ms(), tx_cancel));
                             let fut = Self::proposal_waiter(wait_for, (consensus_message, header), rx_cancel);
                             //println!("created proposal waiter");
                             proposal_waiting.push(fut);
@@ -342,7 +348,7 @@ impl HeaderWaiter {
                         }
                         let _ = self.parent_requests.remove(&header.parent_cert.header_digest);
 
-                        self.tx_core.send(header).await.expect("Failed to send header");
+                        self.tx_core.send(header).expect("Failed to send header");
                     },
                     Ok(None) => {
                         // This request has been canceled.
@@ -372,7 +378,7 @@ impl HeaderWaiter {
                             let _ = self.parent_requests.remove(&prop.header_digest);
                         }
                      
-                        self.tx_consensus_loopback.send(deliver).await.expect("Failed to send header");
+                        self.tx_consensus_loopback.send(deliver).expect("Failed to send header");
                     },
                     Ok(None) => {
                         // This request has been canceled.
@@ -423,21 +429,18 @@ impl HeaderWaiter {
                 }
             }
 
-            // Cleanup internal state.
-            let round = self.consensus_round.load(Ordering::Relaxed);
-            if round > self.gc_depth {
-                let mut gc_round = round - self.gc_depth;
-
-                for (r, handler) in self.pending.values() {
-                    if r <= &gc_round {
-                        let _ = handler.send(()).await;
-                    }
+            // Expire pending syncs by age (see `sync_expiry_ms`).
+            let now = now_ms();
+            let expiry = self.sync_expiry_ms;
+            for (since, handler) in self.pending.values() {
+                if since + expiry < now {
+                    let _ = handler.send(()).await;
                 }
-                self.pending.retain(|_, (r, _)| r > &mut gc_round);
-                self.batch_requests.retain(|_, r| r > &mut gc_round);
-                self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
-                self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
             }
+            self.pending.retain(|_, (since, _)| *since + expiry >= now);
+            self.batch_requests.retain(|_, since| *since + expiry >= now);
+            self.parent_requests.retain(|_, (_, since)| *since + expiry >= now);
+            self.header_requests.retain(|_, (_, since)| *since + expiry >= now);
         }
     }
 }

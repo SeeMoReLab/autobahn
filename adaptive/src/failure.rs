@@ -1,37 +1,139 @@
-//! Protocol-specific failure injection: the proposal-delay controller, a port
-//! of SmartBFT/examples/smallbank/failure.go. It reads the shared failure-spec
-//! XML (the `<hotstuff><proposalDelay>` or `<autobahn><proposalDelay>`
-//! section), anchored to the harness-wide `--failure-start-unix-ms`
-//! timestamp, and answers "how long should this replica delay its proposal
-//! right now".
+//! Protocol-level fault injection, driven by the shared failure-spec XML and
+//! anchored to the harness-wide `--failure-start-unix-ms` timestamp. The
+//! network faults in the same file are applied by
+//! `scripts/apply_network_failures.py`; this module handles the faults a
+//! replica inflicts from inside the protocol.
 //!
-//! Semantics mirrored from the Go reference:
-//! - `warmUpTime`/`warmUpTimeMs` shifts all phases.
-//! - Phase start comes from `startAtMs`/`atTimeMs`/`startAt`/`atTime`/`time`
-//!   (first present wins, in that order); phases sort by start then document
-//!   order.
-//! - `interval`/`intervalMs` repeats a phase every interval until the next
-//!   phase's start (or `count` repetitions); with `<id>leader</id>` the leader
-//!   window is re-resolved (pinned) once per interval tick.
-//! - The leader window is the leader plus the next `(n-1)/3 - 1` replicas in
-//!   ascending id order (window size `(n-1)/3`, i.e. f).
-//! - Explicit replica ids take precedence over the leader-window rule.
-//! - Replica ids in the spec are global 0-based ids.
+//! Faults are always keyed by explicit global replica id. Both supported
+//! protocols rotate leaders (HotStuff per round, Autobahn per slot with
+//! several slots open at once), so "the leader" names no single replica over
+//! a phase; the `leader` token is rejected at load time. A fixed replica id
+//! is the well-defined slow-leader fault: that replica leads one turn in n,
+//! and the view-change timeout caps the damage of each of its turns.
+//!
+//! Two fault kinds, per protocol section:
+//!
+//! - `<proposalDelay>`: the replica delays the consensus proposals it leads.
+//!   In HotStuff that is the block proposal. In Autobahn `<messages>` selects
+//!   which leader-originated phases are held (`prepare` by default, so the
+//!   fault means the same thing as in HotStuff; `confirm` and `commit` are
+//!   available for a leader that is slow in every phase), and
+//!   `<forceSlowPath>` makes the leader ignore a unanimous Prepare QC and
+//!   take the slow path after its own fast-path wait, which to followers is
+//!   indistinguishable from an honest leader stuck behind a silent voter.
+//! - `<voteDelay>` (Autobahn only): the replica delays its consensus votes
+//!   and nothing else. This is the fault that isolates `fast_path_timeout`:
+//!   the late vote defeats unanimity without making the replica's own
+//!   proposals late.
+//!
+//! A delay is either `<delayMs>` (fixed) or `<delayRelativeToTimeoutMs>`
+//! (the replica's current view-change timeout plus a signed offset, clamped
+//! at zero). The relative form is the worst-case legal leader: it stretches
+//! every turn to just under the timeout and is never deposed.
+//!
+//! Phases sort by start then document order; `warmUpTime`/`warmUpTimeMs`
+//! shifts all of them. The old `<interval>`/`<count>` repetition existed only
+//! to re-resolve the `leader` token per tick and is rejected too.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const LEADER_REPLICA_TOKEN: &str = "leader";
+const LEADER_TOKEN: &str = "leader";
 
 /// Which protocol section of the spec to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolSection {
     Hotstuff,
     Autobahn,
+}
+
+impl ProtocolSection {
+    fn tag(self) -> &'static str {
+        match self {
+            ProtocolSection::Hotstuff => "hotstuff",
+            ProtocolSection::Autobahn => "autobahn",
+        }
+    }
+}
+
+/// How long a targeted replica holds a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultDelay {
+    /// A fixed delay.
+    Fixed(Duration),
+    /// The replica's current view-change timeout plus `offset_ms`, clamped
+    /// at zero. Negative offsets give the "just under the timeout" leader.
+    RelativeToTimeout { offset_ms: i64 },
+}
+
+impl FaultDelay {
+    /// The concrete delay to apply given the replica's live view-change
+    /// timeout.
+    pub fn resolve(&self, current_timeout: Duration) -> Duration {
+        match *self {
+            FaultDelay::Fixed(d) => d,
+            FaultDelay::RelativeToTimeout { offset_ms } => {
+                let base = current_timeout.as_millis() as i64;
+                Duration::from_millis(base.saturating_add(offset_ms).max(0) as u64)
+            }
+        }
+    }
+}
+
+/// Which leader-originated Autobahn consensus messages a proposal delay
+/// holds. HotStuff has a single proposal per turn and ignores this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalMessages {
+    pub prepare: bool,
+    pub confirm: bool,
+    pub commit: bool,
+}
+
+impl Default for ProposalMessages {
+    fn default() -> Self {
+        Self {
+            prepare: true,
+            confirm: false,
+            commit: false,
+        }
+    }
+}
+
+impl ProposalMessages {
+    fn parse(text: &str) -> Result<Self> {
+        let mut set = Self {
+            prepare: false,
+            confirm: false,
+            commit: false,
+        };
+        for raw in text.split(',') {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "" => continue,
+                "prepare" => set.prepare = true,
+                "confirm" => set.confirm = true,
+                "commit" => set.commit = true,
+                other => bail!(
+                    "invalid <messages> entry {:?} in proposalDelay (expected prepare, confirm, commit)",
+                    other
+                ),
+            }
+        }
+        if !(set.prepare || set.confirm || set.commit) {
+            bail!("<messages> in proposalDelay selects no message");
+        }
+        Ok(set)
+    }
+}
+
+/// The proposal-side fault active for one replica.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalFault {
+    pub delay: FaultDelay,
+    pub messages: ProposalMessages,
+    pub force_slow_path: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,16 +170,32 @@ struct PhaseXml {
 struct ProtocolSectionXml {
     #[serde(rename = "proposalDelay")]
     proposal_delay: Option<ProposalDelayXml>,
+    #[serde(rename = "voteDelay")]
+    vote_delay: Option<VoteDelayXml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ProposalDelayXml {
     #[serde(rename = "delayMs")]
     delay_ms: Option<i64>,
+    #[serde(rename = "delayRelativeToTimeoutMs")]
+    delay_relative_to_timeout_ms: Option<i64>,
+    messages: Option<String>,
+    #[serde(rename = "forceSlowPath")]
+    force_slow_path: Option<bool>,
     interval: Option<f64>,
     #[serde(rename = "intervalMs")]
     interval_ms: Option<i64>,
     count: Option<i64>,
+    replicas: Option<ReplicasXml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VoteDelayXml {
+    #[serde(rename = "delayMs")]
+    delay_ms: Option<i64>,
+    #[serde(rename = "delayRelativeToTimeoutMs")]
+    delay_relative_to_timeout_ms: Option<i64>,
     replicas: Option<ReplicasXml>,
 }
 
@@ -94,33 +212,32 @@ struct ReplicaXml {
     id: String,
     #[serde(rename = "delayMs")]
     delay_ms: Option<i64>,
+    #[serde(rename = "delayRelativeToTimeoutMs")]
+    delay_relative_to_timeout_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct ProposalDelayRule {
-    replica_delays: HashMap<u32, Duration>,
-    leader_window_delay: Duration,
-    has_leader_window_rule: bool,
+struct FaultRule {
+    proposal: HashMap<u32, ProposalFault>,
+    vote: HashMap<u32, FaultDelay>,
 }
 
 #[derive(Clone, Debug)]
-struct FailurePhase {
+struct FaultPhase {
     start_offset: Duration,
-    interval: Duration,
-    order: usize,
-    rule: ProposalDelayRule,
+    rule: FaultRule,
 }
 
-pub struct ProposalDelayController {
+#[derive(Debug)]
+pub struct FaultController {
     enabled: bool,
     start_unix_ms: u64,
     warm_up: Duration,
-    phases: Vec<FailurePhase>,
+    phases: Vec<FaultPhase>,
     last_logged_phase: AtomicI64,
-    pinned_replicas: Mutex<HashMap<i64, HashMap<u32, Duration>>>,
 }
 
-impl ProposalDelayController {
+impl FaultController {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -128,7 +245,6 @@ impl ProposalDelayController {
             warm_up: Duration::ZERO,
             phases: Vec::new(),
             last_logged_phase: AtomicI64::new(-2),
-            pinned_replicas: Mutex::new(HashMap::new()),
         }
     }
 
@@ -144,7 +260,7 @@ impl ProposalDelayController {
             Duration::ZERO
         };
 
-        let mut raw_phases: Vec<(Duration, usize, ProposalDelayXml)> = Vec::new();
+        let mut raw: Vec<(Duration, usize, FaultRule)> = Vec::new();
         for (order, phase) in spec
             .phases
             .map(|p| p.phases)
@@ -156,30 +272,23 @@ impl ProposalDelayController {
             let section_xml = match section {
                 ProtocolSection::Hotstuff => phase.hotstuff,
                 ProtocolSection::Autobahn => phase.autobahn,
-            };
-            let delay = section_xml
-                .unwrap_or_default()
-                .proposal_delay
-                .unwrap_or_default();
-            raw_phases.push((start, order, delay));
+            }
+            .unwrap_or_default();
+            let rule = parse_rule(&section_xml, section)
+                .with_context(|| format!("phase #{} (<{}> section)", order, section.tag()))?;
+            raw.push((start, order, rule));
         }
-        raw_phases.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-        let mut phases: Vec<FailurePhase> = Vec::new();
-        for i in 0..raw_phases.len() {
-            let next_start = raw_phases.get(i + 1).map(|p| p.0);
-            let (start, order, delay) = &raw_phases[i];
-            append_proposal_delay_phases(&mut phases, *start, *order, delay, next_start)?;
-        }
-        phases.sort_by(|a, b| a.start_offset.cmp(&b.start_offset).then(a.order.cmp(&b.order)));
+        raw.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
         Ok(Self {
             enabled: true,
             start_unix_ms,
             warm_up,
-            phases,
+            phases: raw
+                .into_iter()
+                .map(|(start_offset, _, rule)| FaultPhase { start_offset, rule })
+                .collect(),
             last_logged_phase: AtomicI64::new(-2),
-            pinned_replicas: Mutex::new(HashMap::new()),
         })
     }
 
@@ -198,34 +307,22 @@ impl ProposalDelayController {
         Duration::from_millis(elapsed_ms).checked_sub(self.warm_up)
     }
 
-    fn active_phase(&self, elapsed_since_warmup: Option<Duration>) -> i64 {
-        let Some(elapsed) = elapsed_since_warmup else {
-            return -1;
-        };
+    fn active_phase(&self) -> Option<&FaultPhase> {
+        if !self.enabled {
+            return None;
+        }
         let mut active: i64 = -1;
-        for (idx, phase) in self.phases.iter().enumerate() {
-            if elapsed >= phase.start_offset {
-                active = idx as i64;
-            } else {
-                break;
+        if let Some(elapsed) = self.elapsed_since_warmup() {
+            for (idx, phase) in self.phases.iter().enumerate() {
+                if elapsed >= phase.start_offset {
+                    active = idx as i64;
+                } else {
+                    break;
+                }
             }
         }
-        active
-    }
-
-    fn pin_key(&self, active_phase: i64, elapsed_since_warmup: Duration) -> (i64, i64) {
-        let Some(phase) = usize::try_from(active_phase)
-            .ok()
-            .and_then(|i| self.phases.get(i))
-        else {
-            return (active_phase, 0);
-        };
-        let mut tick = 0i64;
-        if phase.interval > Duration::ZERO && elapsed_since_warmup >= phase.start_offset {
-            tick = ((elapsed_since_warmup - phase.start_offset).as_nanos()
-                / phase.interval.as_nanos()) as i64;
-        }
-        ((active_phase << 32) | tick, tick)
+        self.log_phase_change(active);
+        usize::try_from(active).ok().and_then(|i| self.phases.get(i))
     }
 
     fn log_phase_change(&self, active_phase: i64) {
@@ -241,147 +338,38 @@ impl ProposalDelayController {
             return;
         }
         if active_phase < 0 {
-            log::info!("proposal-delay injection phase changed: inactive");
+            log::info!("fault injection phase changed: inactive");
         } else {
             let phase = &self.phases[active_phase as usize];
             log::info!(
-                "proposal-delay injection phase changed: index={} start_offset_ms={}",
+                "fault injection phase changed: index={} start_offset_ms={} proposal_targets={:?} vote_targets={:?}",
                 active_phase,
-                phase.start_offset.as_millis()
+                phase.start_offset.as_millis(),
+                sorted_keys(&phase.rule.proposal),
+                sorted_keys(&phase.rule.vote),
             );
         }
     }
 
-    /// Observe the current leader; pins the leader window for the active
-    /// phase/interval tick if a leader-window rule is active. Call whenever
-    /// the local replica learns the leader (e.g. on view change and
-    /// periodically while stable). `replica_ids` are 0-based global ids of
-    /// all replicas; `leader` is the current leader's id.
-    pub fn observe_leader(&self, leader: u32, replica_ids: &[u32]) {
-        if !self.enabled {
-            return;
-        }
-        let elapsed = self.elapsed_since_warmup();
-        let active_phase = self.active_phase(elapsed);
-        self.log_phase_change(active_phase);
-        if active_phase < 0 {
-            return;
-        }
-        let (pin_key, tick) = self.pin_key(active_phase, elapsed.unwrap());
-        self.pin_leader_window(active_phase, pin_key, tick, leader, replica_ids);
+    /// The proposal-delay fault this replica must apply right now, if the
+    /// active phase targets it.
+    pub fn proposal_fault(&self, replica_id: u32) -> Option<ProposalFault> {
+        self.active_phase()
+            .and_then(|phase| phase.rule.proposal.get(&replica_id).copied())
     }
 
-    /// The delay for this replica from the active phase's explicit rules and
-    /// the already-pinned leader window, without re-resolving the leader.
-    /// Use when the caller does not know the current leader (a separate
-    /// component must call [`Self::observe_leader`] to maintain the pins).
-    pub fn delay_for(&self, replica_id: u32) -> Duration {
-        if !self.enabled {
-            return Duration::ZERO;
-        }
-        let elapsed = self.elapsed_since_warmup();
-        let active_phase = self.active_phase(elapsed);
-        self.log_phase_change(active_phase);
-        if active_phase < 0 {
-            return Duration::ZERO;
-        }
-        let rule = &self.phases[active_phase as usize].rule;
-        if let Some(delay) = rule.replica_delays.get(&replica_id) {
-            return *delay;
-        }
-        if !rule.has_leader_window_rule {
-            return Duration::ZERO;
-        }
-        let (pin_key, _) = self.pin_key(active_phase, elapsed.unwrap());
-        self.pinned_replicas
-            .lock()
-            .unwrap()
-            .get(&pin_key)
-            .and_then(|window| window.get(&replica_id))
-            .copied()
-            .unwrap_or(Duration::ZERO)
+    /// The vote delay this replica must apply right now, if the active phase
+    /// targets it.
+    pub fn vote_delay(&self, replica_id: u32) -> Option<FaultDelay> {
+        self.active_phase()
+            .and_then(|phase| phase.rule.vote.get(&replica_id).copied())
     }
+}
 
-    /// The delay this replica must add before its proposal right now.
-    pub fn delay_for_proposal(&self, replica_id: u32, leader: u32, replica_ids: &[u32]) -> Duration {
-        if !self.enabled {
-            return Duration::ZERO;
-        }
-        // Keep the pinned window fresh even if the caller forgets to call
-        // observe_leader separately.
-        self.observe_leader(leader, replica_ids);
-
-        let elapsed = self.elapsed_since_warmup();
-        let active_phase = self.active_phase(elapsed);
-        if active_phase < 0 {
-            return Duration::ZERO;
-        }
-        let rule = &self.phases[active_phase as usize].rule;
-        if let Some(delay) = rule.replica_delays.get(&replica_id) {
-            return *delay;
-        }
-        if !rule.has_leader_window_rule {
-            return Duration::ZERO;
-        }
-        let (pin_key, _) = self.pin_key(active_phase, elapsed.unwrap());
-        self.pinned_replicas
-            .lock()
-            .unwrap()
-            .get(&pin_key)
-            .and_then(|window| window.get(&replica_id))
-            .copied()
-            .unwrap_or(Duration::ZERO)
-    }
-
-    fn pin_leader_window(
-        &self,
-        active_phase: i64,
-        pin_key: i64,
-        tick: i64,
-        leader: u32,
-        replica_ids: &[u32],
-    ) {
-        let mut pinned = self.pinned_replicas.lock().unwrap();
-        if pinned.get(&pin_key).map(|m| !m.is_empty()).unwrap_or(false) {
-            return;
-        }
-        let Some(phase) = usize::try_from(active_phase)
-            .ok()
-            .and_then(|i| self.phases.get(i))
-        else {
-            return;
-        };
-        if !phase.rule.has_leader_window_rule {
-            return;
-        }
-
-        let mut nodes: Vec<u32> = replica_ids.to_vec();
-        nodes.sort_unstable();
-        let Some(leader_pos) = nodes.iter().position(|id| *id == leader) else {
-            return;
-        };
-
-        // Window size f = (n-1)/3: the leader plus the next f-1 replicas in id
-        // order.
-        let window_size = ((nodes.len().saturating_sub(1)) / 3).min(nodes.len());
-        let mut resolved = HashMap::new();
-        let mut targets = Vec::with_capacity(window_size);
-        for offset in 0..window_size {
-            let target = nodes[(leader_pos + offset) % nodes.len()];
-            resolved.insert(target, phase.rule.leader_window_delay);
-            targets.push(target);
-        }
-
-        pinned.insert(pin_key, resolved);
-        log::info!(
-            "resolved leader proposal delay window: phase={} interval_tick={} leader_replica={} delay_ms={} targets={:?}",
-            phase.order,
-            tick,
-            leader,
-            phase.rule.leader_window_delay.as_millis(),
-            targets
-        );
-    }
+fn sorted_keys<V>(map: &HashMap<u32, V>) -> Vec<u32> {
+    let mut keys: Vec<u32> = map.keys().copied().collect();
+    keys.sort_unstable();
+    keys
 }
 
 fn phase_start(phase: &PhaseXml) -> Duration {
@@ -403,119 +391,134 @@ fn phase_start(phase: &PhaseXml) -> Duration {
     Duration::ZERO
 }
 
-fn append_proposal_delay_phases(
-    phases: &mut Vec<FailurePhase>,
-    start: Duration,
-    order: usize,
-    delay: &ProposalDelayXml,
-    next_start: Option<Duration>,
-) -> Result<()> {
-    let rule = parse_proposal_delay_rule(delay)?;
-    let interval = if let Some(ms) = delay.interval_ms {
-        non_negative_ms(ms)
-    } else if let Some(s) = delay.interval {
-        non_negative_secs(s)
-    } else {
-        Duration::ZERO
-    };
+fn parse_rule(section: &ProtocolSectionXml, protocol: ProtocolSection) -> Result<FaultRule> {
+    let mut rule = FaultRule::default();
 
-    if interval == Duration::ZERO {
-        phases.push(FailurePhase {
-            start_offset: start,
-            interval: Duration::ZERO,
-            order,
-            rule,
-        });
-        return Ok(());
-    }
-
-    let count = delay.count.filter(|c| *c > 0).unwrap_or(0) as usize;
-    let max_start = next_start.filter(|next| *next > start);
-
-    let mut added = 0usize;
-    let mut phase_start = start;
-    loop {
-        if let Some(max) = max_start {
-            if phase_start >= max {
-                break;
+    if let Some(pd) = &section.proposal_delay {
+        if pd.interval.is_some() || pd.interval_ms.is_some() || pd.count.is_some() {
+            bail!(
+                "<interval>/<intervalMs>/<count> are no longer supported in proposalDelay; \
+                 faults target fixed replica ids and need no per-tick re-resolution"
+            );
+        }
+        let mut messages = ProposalMessages::default();
+        let mut force_slow_path = false;
+        match protocol {
+            ProtocolSection::Autobahn => {
+                if let Some(text) = &pd.messages {
+                    messages = ProposalMessages::parse(text)?;
+                }
+                force_slow_path = pd.force_slow_path.unwrap_or(false);
+            }
+            ProtocolSection::Hotstuff => {
+                if pd.messages.is_some() {
+                    bail!("<messages> in proposalDelay is Autobahn-only; HotStuff has one proposal per round");
+                }
+                if pd.force_slow_path.is_some() {
+                    bail!("<forceSlowPath> in proposalDelay is Autobahn-only; HotStuff has no fast path");
+                }
             }
         }
-        if count > 0 && added >= count {
-            break;
+        let default_delay = parse_delay(pd.delay_ms, pd.delay_relative_to_timeout_ms, "proposalDelay")?;
+        for (id, delay) in parse_targets(pd.replicas.as_ref(), default_delay, "proposalDelay")? {
+            rule.proposal.insert(
+                id,
+                ProposalFault {
+                    delay,
+                    messages,
+                    force_slow_path,
+                },
+            );
         }
-        phases.push(FailurePhase {
-            start_offset: phase_start,
-            interval,
-            order,
-            rule: rule.clone(),
-        });
-        added += 1;
-        if max_start.is_none() && count == 0 {
-            break;
-        }
-        phase_start += interval;
     }
 
-    if added == 0 {
-        phases.push(FailurePhase {
-            start_offset: start,
-            interval: Duration::ZERO,
-            order,
-            rule,
-        });
+    if let Some(vd) = &section.vote_delay {
+        if protocol == ProtocolSection::Hotstuff {
+            bail!("<voteDelay> is Autobahn-only; HotStuff has no fast path for a late vote to defeat");
+        }
+        let default_delay = parse_delay(vd.delay_ms, vd.delay_relative_to_timeout_ms, "voteDelay")?;
+        for (id, delay) in parse_targets(vd.replicas.as_ref(), default_delay, "voteDelay")? {
+            rule.vote.insert(id, delay);
+        }
     }
-    Ok(())
+
+    Ok(rule)
 }
 
-fn parse_proposal_delay_rule(delay: &ProposalDelayXml) -> Result<ProposalDelayRule> {
-    let mut rule = ProposalDelayRule::default();
-    let default_delay = delay.delay_ms.map(non_negative_ms);
-    let replicas = delay.replicas.as_ref();
+/// The delay given by a `<delayMs>` / `<delayRelativeToTimeoutMs>` pair;
+/// None if neither is present.
+fn parse_delay(fixed_ms: Option<i64>, relative_ms: Option<i64>, what: &str) -> Result<Option<FaultDelay>> {
+    match (fixed_ms, relative_ms) {
+        (Some(_), Some(_)) => bail!(
+            "{} gives both <delayMs> and <delayRelativeToTimeoutMs>; use exactly one",
+            what
+        ),
+        (Some(ms), None) => Ok(Some(FaultDelay::Fixed(non_negative_ms(ms)))),
+        (None, Some(offset_ms)) => Ok(Some(FaultDelay::RelativeToTimeout { offset_ms })),
+        (None, None) => Ok(None),
+    }
+}
 
-    let replica_entries = replicas.map(|r| r.replicas.as_slice()).unwrap_or_default();
-    for replica in replica_entries {
+/// Resolve the `<replicas>` block of a fault into (replica id, delay) pairs.
+/// Supports both `<replica><id/><delayMs/></replica>` entries (per-replica
+/// delay, falling back to the rule default) and the bare `<id>` list (rule
+/// default required).
+fn parse_targets(
+    replicas: Option<&ReplicasXml>,
+    default_delay: Option<FaultDelay>,
+    what: &str,
+) -> Result<Vec<(u32, FaultDelay)>> {
+    let mut out = Vec::new();
+    let Some(replicas) = replicas else {
+        return Ok(out);
+    };
+
+    for replica in &replicas.replicas {
         let id_text = replica.id.trim();
         if id_text.is_empty() {
             continue;
         }
-        let replica_delay = match replica.delay_ms.map(non_negative_ms).or(default_delay) {
-            Some(d) => d,
-            None => continue,
-        };
-        if id_text.eq_ignore_ascii_case(LEADER_REPLICA_TOKEN) {
-            rule.leader_window_delay = replica_delay;
-            rule.has_leader_window_rule = true;
-            continue;
-        }
-        let replica_id: u32 = id_text
-            .parse()
-            .with_context(|| format!("invalid replica id {:?} in proposalDelay", id_text))?;
-        rule.replica_delays.insert(replica_id, replica_delay);
+        let id = parse_replica_id(id_text, what)?;
+        let delay = parse_delay(replica.delay_ms, replica.delay_relative_to_timeout_ms, what)?
+            .or(default_delay)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} targets replica {} without a delay (set <delayMs> or <delayRelativeToTimeoutMs> on the replica or the rule)",
+                    what, id
+                )
+            })?;
+        out.push((id, delay));
     }
 
-    if !replica_entries.is_empty() {
-        return Ok(rule);
-    }
-    let Some(default_delay) = default_delay else {
-        return Ok(rule);
-    };
-
-    for raw_id in replicas.map(|r| r.ids.as_slice()).unwrap_or_default() {
+    for raw_id in &replicas.ids {
         let id_text = raw_id.trim();
         if id_text.is_empty() {
             continue;
         }
-        if id_text.eq_ignore_ascii_case(LEADER_REPLICA_TOKEN) {
-            rule.leader_window_delay = default_delay;
-            rule.has_leader_window_rule = true;
-            continue;
-        }
-        let replica_id: u32 = id_text
-            .parse()
-            .with_context(|| format!("invalid replica id {:?} in proposalDelay", id_text))?;
-        rule.replica_delays.insert(replica_id, default_delay);
+        let id = parse_replica_id(id_text, what)?;
+        let delay = default_delay.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} lists replica {} by bare <id> but sets no rule-level delay",
+                what, id
+            )
+        })?;
+        out.push((id, delay));
     }
-    Ok(rule)
+
+    Ok(out)
+}
+
+fn parse_replica_id(id_text: &str, what: &str) -> Result<u32> {
+    if id_text.eq_ignore_ascii_case(LEADER_TOKEN) {
+        bail!(
+            "<id>leader</id> is not supported in {}: both HotStuff and Autobahn rotate leaders, \
+             so name a fixed global replica id instead",
+            what
+        );
+    }
+    id_text
+        .parse()
+        .with_context(|| format!("invalid replica id {:?} in {}", id_text, what))
 }
 
 fn non_negative_ms(value: i64) -> Duration {
@@ -546,32 +549,46 @@ mod tests {
                 <directedEdges>true</directedEdges>
                 <global><delayMs>0</delayMs><burstDurationMs>0</burstDurationMs><burstIntervalMs>0</burstIntervalMs></global>
             </network>
-            <hotstuff>
+            <autobahn>
                 <proposalDelay>
                     <replicas></replicas>
                 </proposalDelay>
-            </hotstuff>
+            </autobahn>
         </phase>
         <phase>
             <atTime>60</atTime>
+            <autobahn>
+                <proposalDelay>
+                    <messages>prepare,confirm</messages>
+                    <forceSlowPath>true</forceSlowPath>
+                    <replicas>
+                        <replica><id>3</id><delayMs>3000</delayMs></replica>
+                    </replicas>
+                </proposalDelay>
+                <voteDelay>
+                    <replicas>
+                        <replica><id>1</id><delayMs>800</delayMs></replica>
+                    </replicas>
+                </voteDelay>
+            </autobahn>
             <hotstuff>
                 <proposalDelay>
-                    <interval>30</interval>
+                    <delayMs>2500</delayMs>
                     <replicas>
-                        <replica><id>leader</id><delayMs>3000</delayMs></replica>
+                        <id>3</id>
                     </replicas>
                 </proposalDelay>
             </hotstuff>
         </phase>
         <phase>
             <atTime>120</atTime>
-            <hotstuff>
+            <autobahn>
                 <proposalDelay>
                     <replicas>
-                        <replica><id>2</id><delayMs>500</delayMs></replica>
+                        <replica><id>2</id><delayRelativeToTimeoutMs>-100</delayRelativeToTimeoutMs></replica>
                     </replicas>
                 </proposalDelay>
-            </hotstuff>
+            </autobahn>
         </phase>
     </phases>
 </failureSpec>"#;
@@ -583,102 +600,173 @@ mod tests {
             .as_millis() as u64
     }
 
-    fn controller_at(offset_from_warmup: Duration) -> ProposalDelayController {
-        // Position "now" at warmUp + offset past start.
+    /// A controller whose "now" sits `offset_from_warmup` past the end of
+    /// the 10 s warm-up.
+    fn controller_at(offset_from_warmup: Duration, section: ProtocolSection) -> FaultController {
         let start = now_unix_ms() - 10_000 - offset_from_warmup.as_millis() as u64;
-        ProposalDelayController::load(SPEC, start, ProtocolSection::Hotstuff).unwrap()
+        FaultController::load(SPEC, start, section).unwrap()
     }
 
     #[test]
     fn parses_real_spec_shape() {
-        let ctrl = ProposalDelayController::load(SPEC, now_unix_ms(), ProtocolSection::Hotstuff).unwrap();
-        // Phase 1 repeats every 30s until phase 2 at 120s: entries at 60 and
-        // 90, plus phase 0 and phase 2.
-        assert_eq!(ctrl.phases.len(), 4);
+        let ctrl = FaultController::load(SPEC, now_unix_ms(), ProtocolSection::Autobahn).unwrap();
+        assert_eq!(ctrl.phases.len(), 3);
         assert_eq!(ctrl.warm_up, Duration::from_secs(10));
-        assert!(ctrl.phases[1].rule.has_leader_window_rule);
+        let phase1 = &ctrl.phases[1].rule;
         assert_eq!(
-            ctrl.phases[1].rule.leader_window_delay,
-            Duration::from_millis(3000)
+            phase1.proposal.get(&3),
+            Some(&ProposalFault {
+                delay: FaultDelay::Fixed(Duration::from_millis(3000)),
+                messages: ProposalMessages {
+                    prepare: true,
+                    confirm: true,
+                    commit: false
+                },
+                force_slow_path: true,
+            })
         );
         assert_eq!(
-            ctrl.phases[3].rule.replica_delays.get(&2),
-            Some(&Duration::from_millis(500))
+            phase1.vote.get(&1),
+            Some(&FaultDelay::Fixed(Duration::from_millis(800)))
         );
+        assert!(phase1.vote.get(&3).is_none());
+    }
+
+    #[test]
+    fn hotstuff_section_reads_bare_id_list_with_rule_default() {
+        let ctrl = controller_at(Duration::from_secs(100), ProtocolSection::Hotstuff);
+        assert_eq!(
+            ctrl.proposal_fault(3),
+            Some(ProposalFault {
+                delay: FaultDelay::Fixed(Duration::from_millis(2500)),
+                messages: ProposalMessages::default(),
+                force_slow_path: false,
+            })
+        );
+        assert!(ctrl.proposal_fault(1).is_none());
+        // The autobahn-only vote fault never leaks into the hotstuff view.
+        assert!(ctrl.vote_delay(1).is_none());
     }
 
     #[test]
     fn warmup_disables_injection() {
-        // Now is before warm-up completes.
-        let ctrl =
-            ProposalDelayController::load(SPEC, now_unix_ms(), ProtocolSection::Hotstuff).unwrap();
-        let all: Vec<u32> = (0..4).collect();
-        assert_eq!(ctrl.delay_for_proposal(0, 0, &all), Duration::ZERO);
+        let ctrl = FaultController::load(SPEC, now_unix_ms(), ProtocolSection::Autobahn).unwrap();
+        assert!(ctrl.proposal_fault(3).is_none());
+        assert!(ctrl.vote_delay(1).is_none());
     }
 
     #[test]
-    fn leader_window_targets_leader_and_successors() {
-        // 100s past warm-up: inside the leader-delay phase (60..120).
-        let ctrl = controller_at(Duration::from_secs(100));
-        let all: Vec<u32> = (0..7).collect(); // n=7 -> f=2 -> window {leader, leader+1}
+    fn faults_follow_the_active_phase() {
+        // 30 s past warm-up: phase 0, no targets.
+        let ctrl = controller_at(Duration::from_secs(30), ProtocolSection::Autobahn);
+        assert!(ctrl.proposal_fault(3).is_none());
+        // 100 s: phase 1 targets 3 (proposal) and 1 (vote).
+        let ctrl = controller_at(Duration::from_secs(100), ProtocolSection::Autobahn);
+        assert!(ctrl.proposal_fault(3).is_some());
+        assert!(ctrl.proposal_fault(2).is_none());
+        assert!(ctrl.vote_delay(1).is_some());
+        // 200 s: phase 2 targets 2 only.
+        let ctrl = controller_at(Duration::from_secs(200), ProtocolSection::Autobahn);
+        assert!(ctrl.proposal_fault(3).is_none());
+        assert!(ctrl.vote_delay(1).is_none());
         assert_eq!(
-            ctrl.delay_for_proposal(3, 3, &all),
-            Duration::from_millis(3000)
-        );
-        assert_eq!(
-            ctrl.delay_for_proposal(4, 3, &all),
-            Duration::from_millis(3000)
-        );
-        assert_eq!(ctrl.delay_for_proposal(5, 3, &all), Duration::ZERO);
-        assert_eq!(ctrl.delay_for_proposal(2, 3, &all), Duration::ZERO);
-    }
-
-    #[test]
-    fn leader_window_pins_within_interval_tick() {
-        let ctrl = controller_at(Duration::from_secs(100));
-        let all: Vec<u32> = (0..4).collect(); // n=4 -> f=1 -> window {leader}
-        // First resolution pins leader 1.
-        assert_eq!(
-            ctrl.delay_for_proposal(1, 1, &all),
-            Duration::from_millis(3000)
-        );
-        // Later leader change within the same tick does not re-pin: replica 2
-        // is not delayed even though it now leads.
-        assert_eq!(ctrl.delay_for_proposal(2, 2, &all), Duration::ZERO);
-        // The originally pinned replica stays delayed.
-        assert_eq!(
-            ctrl.delay_for_proposal(1, 2, &all),
-            Duration::from_millis(3000)
+            ctrl.proposal_fault(2).map(|f| f.delay),
+            Some(FaultDelay::RelativeToTimeout { offset_ms: -100 })
         );
     }
 
     #[test]
-    fn explicit_replica_rule_applies() {
-        let ctrl = controller_at(Duration::from_secs(200)); // phase at 120s
-        let all: Vec<u32> = (0..4).collect();
-        assert_eq!(
-            ctrl.delay_for_proposal(2, 0, &all),
-            Duration::from_millis(500)
+    fn relative_delay_resolves_against_the_live_timeout() {
+        let d = FaultDelay::RelativeToTimeout { offset_ms: -100 };
+        assert_eq!(d.resolve(Duration::from_millis(600)), Duration::from_millis(500));
+        assert_eq!(d.resolve(Duration::from_millis(50)), Duration::ZERO);
+        let f = FaultDelay::Fixed(Duration::from_millis(3000));
+        assert_eq!(f.resolve(Duration::from_millis(600)), Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn disabled_controller_has_no_faults() {
+        let ctrl = FaultController::disabled();
+        assert!(ctrl.proposal_fault(0).is_none());
+        assert!(ctrl.vote_delay(0).is_none());
+    }
+
+    fn spec_with(section: &str, body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><failureSpec><warmUpTime>0</warmUpTime><phases><phase><atTime>0</atTime><{s}>{b}</{s}></phase></phases></failureSpec>"#,
+            s = section,
+            b = body
+        )
+    }
+
+    #[test]
+    fn leader_token_is_rejected() {
+        let xml = spec_with(
+            "hotstuff",
+            "<proposalDelay><replicas><replica><id>leader</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
         );
-        assert_eq!(ctrl.delay_for_proposal(0, 0, &all), Duration::ZERO);
+        let err = FaultController::load(&xml, 0, ProtocolSection::Hotstuff).unwrap_err();
+        assert!(format!("{:#}", err).contains("leader"), "{:#}", err);
     }
 
     #[test]
-    fn disabled_controller_returns_zero() {
-        let ctrl = ProposalDelayController::disabled();
-        assert_eq!(ctrl.delay_for_proposal(0, 0, &[0, 1, 2, 3]), Duration::ZERO);
+    fn interval_is_rejected() {
+        let xml = spec_with(
+            "autobahn",
+            "<proposalDelay><interval>60</interval><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
+        );
+        let err = FaultController::load(&xml, 0, ProtocolSection::Autobahn).unwrap_err();
+        assert!(format!("{:#}", err).contains("interval"), "{:#}", err);
     }
 
     #[test]
-    fn missing_section_yields_no_delays() {
-        let ctrl = controller_at(Duration::from_secs(100));
-        // Same instant but reading the autobahn section of a hotstuff-only spec.
-        let start = now_unix_ms() - 110_000;
-        let autobahn =
-            ProposalDelayController::load(SPEC, start, ProtocolSection::Autobahn).unwrap();
-        let all: Vec<u32> = (0..4).collect();
-        assert_eq!(autobahn.delay_for_proposal(1, 1, &all), Duration::ZERO);
-        // Sanity: the hotstuff view of the same time window does delay.
-        assert_ne!(ctrl.delay_for_proposal(1, 1, &all), Duration::ZERO);
+    fn autobahn_only_fields_are_rejected_for_hotstuff() {
+        let vote = spec_with(
+            "hotstuff",
+            "<voteDelay><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></voteDelay>",
+        );
+        assert!(FaultController::load(&vote, 0, ProtocolSection::Hotstuff).is_err());
+        let msgs = spec_with(
+            "hotstuff",
+            "<proposalDelay><messages>prepare</messages><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
+        );
+        assert!(FaultController::load(&msgs, 0, ProtocolSection::Hotstuff).is_err());
+        // The same body is fine under the autobahn section.
+        let ok = spec_with(
+            "autobahn",
+            "<proposalDelay><messages>prepare</messages><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
+        );
+        assert!(FaultController::load(&ok, 0, ProtocolSection::Autobahn).is_ok());
+    }
+
+    #[test]
+    fn missing_or_conflicting_delays_are_rejected() {
+        let none = spec_with(
+            "autobahn",
+            "<proposalDelay><replicas><replica><id>1</id></replica></replicas></proposalDelay>",
+        );
+        assert!(FaultController::load(&none, 0, ProtocolSection::Autobahn).is_err());
+        let both = spec_with(
+            "autobahn",
+            "<proposalDelay><replicas><replica><id>1</id><delayMs>1</delayMs><delayRelativeToTimeoutMs>-1</delayRelativeToTimeoutMs></replica></replicas></proposalDelay>",
+        );
+        assert!(FaultController::load(&both, 0, ProtocolSection::Autobahn).is_err());
+        let bad_msgs = spec_with(
+            "autobahn",
+            "<proposalDelay><messages>prepare,vote</messages><replicas><replica><id>1</id><delayMs>1</delayMs></replica></replicas></proposalDelay>",
+        );
+        assert!(FaultController::load(&bad_msgs, 0, ProtocolSection::Autobahn).is_err());
+    }
+
+    #[test]
+    fn missing_section_yields_no_faults() {
+        let xml = spec_with(
+            "autobahn",
+            "<proposalDelay><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
+        );
+        let hotstuff = FaultController::load(&xml, 0, ProtocolSection::Hotstuff).unwrap();
+        assert!(hotstuff.proposal_fault(1).is_none());
+        let autobahn = FaultController::load(&xml, 0, ProtocolSection::Autobahn).unwrap();
+        assert!(autobahn.proposal_fault(1).is_some());
     }
 }

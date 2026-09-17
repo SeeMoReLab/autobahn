@@ -27,10 +27,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::net::SocketAddr;
 use std::time::Instant;
+use tokio::time::{sleep, Duration};
 //use std::task::Poll;
 use store::Store;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver};
 use std::cmp::max;
 //use tokio::time::{sleep, Duration, Instant};
 
@@ -58,9 +60,9 @@ pub struct Core {
     /// Receiver for dag messages (headers, votes, certificates).
     rx_primaries: Receiver<PrimaryMessage>,
     /// Receives loopback headers from the `HeaderWaiter`.
-    rx_header_waiter: Receiver<Header>,
+    rx_header_waiter: UnboundedReceiver<Header>,
     /// Receives loopback instances from the 'HeaderWaiter'
-    rx_header_waiter_instances: Receiver<(ConsensusMessage, Header)>,
+    rx_header_waiter_instances: UnboundedReceiver<(ConsensusMessage, Header)>,
     /// Receives our newly created headers from the `Proposer`.
     rx_proposer: Receiver<Header>,
     // Output all certificates to the consensus Dag view
@@ -114,6 +116,13 @@ pub struct Core {
     // gc_map: HashMap<Round, Digest>,
   
     committed_slots: HashMap<Slot, CommitQC>,
+    /// Header digests (with their heights) that a verified CommitQC names as
+    /// lane tips. Such a header may be stored without its parent chain: a
+    /// replica that was cut off longer than the gc window can never fetch the
+    /// chain (its peers have dropped it), and the CommitQC already certifies
+    /// the tip. This is what lets the committer's catch-up find the tip
+    /// headers in the store. Entries below the gc round are dropped.
+    trusted_tips: HashMap<Digest, Height>,
     last_committed_slot: u64, 
     //TODO: if we are not enforcing a ticket, then only start when we committed all instances < s-k.
     // If we just check that s-k is committed, but all it's predecessors are not, then we may still open an arbitrary number of instances in the absolute worst case
@@ -127,12 +136,13 @@ pub struct Core {
     fast_path_timeout: u64,
 
     use_ride_share: bool,
-    car_timeout: u64,
     instrumentation: crate::primary::PrimaryInstrumentation,
-    replica_ids: Vec<u32>,
     commits_since_last_timeout: u64,
     car_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Vote> + Send>>>,
     fast_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = ConsensusVote> + Send>>>, // Use this one for Fast Path on external Consensus case
+    /// Fault injection: consensus messages and votes held back by an injected
+    /// delay, released by the main loop so the core itself never sleeps.
+    delayed_sends: FuturesUnordered<Pin<Box<dyn Future<Output = DelayedSend> + Send>>>,
 
     //asynchrony simulation,
     simulate_asynchrony: bool,
@@ -142,6 +152,25 @@ pub struct Core {
     async_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = (Slot, View)> + Send>>>,
     current_time: Instant,
     async_delayed_prepare: Option<ConsensusMessage>,
+}
+
+/// A consensus message or vote whose send is held back by fault injection.
+/// Consensus messages are frozen (signed and serialized) at decision time so
+/// what eventually leaves is what the leader decided then; the leader also
+/// defers processing its own request until the release, so it acts on the
+/// message at the same moment everyone else first sees it.
+struct DelayedSend {
+    label: &'static str,
+    slot: Slot,
+    view: View,
+    addresses: Vec<SocketAddr>,
+    bytes: Bytes,
+    kind: DelayedKind,
+}
+
+enum DelayedKind {
+    Consensus(ConsensusRequest),
+    Vote,
 }
 
 impl Core {
@@ -155,8 +184,8 @@ impl Core {
         consensus_round: Arc<AtomicU64>,
         gc_depth: Height,
         rx_primaries: Receiver<PrimaryMessage>,
-        rx_header_waiter: Receiver<Header>,
-        rx_header_waiter_instances: Receiver<(ConsensusMessage, Header)>,
+        rx_header_waiter: UnboundedReceiver<Header>,
+        rx_header_waiter_instances: UnboundedReceiver<(ConsensusMessage, Header)>,
         rx_proposer: Receiver<Header>,
         tx_committer: Sender<ConsensusMessage>,
         tx_proposer: Sender<Certificate>,
@@ -170,15 +199,12 @@ impl Core {
         use_fast_path: bool,
         fast_path_timeout: u64,
         use_ride_share: bool,
-        car_timeout: u64,
 
         simulate_asynchrony: bool,
         asynchrony_start: u64,
         asynchrony_duration: u64,
         instrumentation: crate::primary::PrimaryInstrumentation,
     ) {
-        let mut replica_ids: Vec<u32> = instrumentation.replica_of.values().copied().collect();
-        replica_ids.sort_unstable();
         tokio::spawn(async move {
             Self {
                 name,
@@ -226,6 +252,7 @@ impl Core {
                 //gc_map: HashMap::with_capacity(2 * gc_depth as usize),
                 
                 committed_slots: HashMap::with_capacity(2 * gc_depth as usize),
+                trusted_tips: HashMap::new(),
                 last_committed_slot: 0,
                 
                 use_fast_path,           //default = true
@@ -234,9 +261,9 @@ impl Core {
                 k,
                 fast_path_timeout,
                 use_ride_share,
-                car_timeout,
                 car_timer_futures: FuturesUnordered::new(),
                 fast_timer_futures: FuturesUnordered::new(),
+                delayed_sends: FuturesUnordered::new(),
 
                 simulate_asynchrony,
                 asynchrony_start,
@@ -246,7 +273,6 @@ impl Core {
                 current_time: Instant::now(),
                 async_delayed_prepare: None,
                 instrumentation,
-                replica_ids,
                 commits_since_last_timeout: 0,
             }
             .run()
@@ -264,12 +290,90 @@ impl Core {
 
     // Resolve the current consensus leader to a global replica id and keep
     // the proposal-delay controller's leader window pinned.
-    fn observe_leader_for_injection(&self, slot: Slot, view: View) {
-        let leader = self.leader_elector.get_leader(slot, view);
-        if let Some(leader_id) = self.instrumentation.replica_of.get(&leader) {
-            self.instrumentation
-                .proposal_delay
-                .observe_leader(*leader_id, &self.replica_ids);
+    /// The injected hold for a leader-originated consensus message, if the
+    /// active fault phase targets this replica and selects this message kind.
+    fn injected_consensus_delay(&self, message: &ConsensusMessage) -> Option<Duration> {
+        let fault = self
+            .instrumentation
+            .faults
+            .proposal_fault(self.instrumentation.replica_id)?;
+        let selected = match message {
+            ConsensusMessage::Prepare { .. } => fault.messages.prepare,
+            ConsensusMessage::Confirm { .. } => fault.messages.confirm,
+            ConsensusMessage::Commit { .. } => fault.messages.commit,
+        };
+        if !selected {
+            return None;
+        }
+        let delay = fault
+            .delay
+            .resolve(Duration::from_millis(self.current_timeout_delay()));
+        (delay > Duration::ZERO).then_some(delay)
+    }
+
+    /// Whether the active fault phase makes this replica, as a leader, ignore
+    /// unanimous Prepare QCs and take the slow path after its fast-path wait.
+    fn injected_force_slow_path(&self) -> bool {
+        self.instrumentation
+            .faults
+            .proposal_fault(self.instrumentation.replica_id)
+            .map_or(false, |fault| fault.force_slow_path)
+    }
+
+    /// The injected hold for this replica's consensus votes, if targeted.
+    fn injected_vote_delay(&self) -> Option<Duration> {
+        let delay = self
+            .instrumentation
+            .faults
+            .vote_delay(self.instrumentation.replica_id)?
+            .resolve(Duration::from_millis(self.current_timeout_delay()));
+        (delay > Duration::ZERO).then_some(delay)
+    }
+
+    /// Release a held message once its injected delay has elapsed. A
+    /// consensus message is dropped if its slot moved to a later view or
+    /// committed meanwhile (the core kept running during the hold); a vote
+    /// is always sent, since a stale vote is ignored by its recipient.
+    async fn flush_delayed_send(&mut self, send: DelayedSend) -> DagResult<()> {
+        let DelayedSend {
+            label,
+            slot,
+            view,
+            addresses,
+            bytes,
+            kind,
+        } = send;
+        match kind {
+            DelayedKind::Consensus(request) => {
+                let stale_view = self
+                    .views
+                    .get(&slot)
+                    .map_or(false, |current| *current > view);
+                if stale_view || self.committed_slots.contains_key(&slot) {
+                    warn!(
+                        "Dropping delayed {} for slot {} view {}: the slot moved on during the injected delay",
+                        label, slot, view
+                    );
+                    return Ok(());
+                }
+                debug!("Releasing delayed {} for slot {} view {}", label, slot, view);
+                let handlers = self.network.broadcast(addresses, bytes).await;
+                self.cancel_handlers
+                    .entry(self.current_header.height())
+                    .or_insert_with(Vec::new)
+                    .extend(handlers);
+                self.process_consensus_request(request).await
+            }
+            DelayedKind::Vote => {
+                debug!("Releasing delayed {} for slot {}", label, slot);
+                let address = addresses[0];
+                let handler = self.network.send(address, bytes).await;
+                self.consensus_cancel_handlers
+                    .entry(slot)
+                    .or_insert_with(Vec::new)
+                    .push(handler);
+                Ok(())
+            }
         }
     }
 
@@ -375,9 +479,25 @@ impl Core {
         debug!("Past header parent cert stake check");
         //println!("After second ensure");
 
+        // Catch-up path. A tip named by a verified CommitQC is stored as-is,
+        // without its payload and without its parent chain, but ONLY when this
+        // replica is far behind on that lane (more than the gc window): it
+        // then adopts such tips as already executed (committer catch-up), so
+        // it never needs their batches, and fetching them (gigabytes for a
+        // long gap) would saturate its worker and stall every peer's batch
+        // maker. A healthy replica must keep the normal path: a committed tip
+        // whose batches are still in flight has to wait for them, otherwise
+        // the committer outputs a header nobody can execute.
+        let known_height = self
+            .current_proposal_tips
+            .get(&header.origin())
+            .map_or(0, |tip| tip.height);
+        let trusted_tip = self.trusted_tips.contains_key(&header.digest())
+            && header.height() > known_height + self.gc_depth;
+
         // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
         // reschedule processing of this header once we have it.
-        if self.synchronizer.missing_payload(&header, sync).await? {
+        if !trusted_tip && self.synchronizer.missing_payload(&header, sync).await? {
             //println!("Missing payload");
             debug!("Processing of {} suspended: missing payload", header);
             return Ok(());
@@ -390,9 +510,16 @@ impl Core {
             .await?
             .is_none()
         {
-            //println!("The parent is missing");
-            debug!("The parent is missing, suspending processing");
-            return Ok(());
+            if trusted_tip {
+                warn!(
+                    "Storing header {} (height {}) without its parent or payload: a CommitQC names it as a lane tip (catch-up after a gap)",
+                    header.id, header.height
+                );
+            } else {
+                //println!("The parent is missing");
+                debug!("The parent is missing, suspending processing");
+                return Ok(());
+            }
         }
 
 
@@ -413,9 +540,10 @@ impl Core {
         //println!("storing the header");
         debug!("storing the header");
 
-        // Store the header since we have the parents (recursively).
+        // Store the header since we have the parents (recursively), or it is a trusted tip.
         let bytes = bincode::serialize(&header).expect("Failed to serialize header");
         self.store.write(header.digest().to_vec(), bytes).await;
+        self.trusted_tips.remove(&header.digest());
 
         // If the header received is at a greater height then add it to our local tips and proposals
         if self.use_optimistic_tips && header.height() > self.current_proposal_tips.get(&header.origin()).unwrap().height {
@@ -614,6 +742,7 @@ impl Core {
             //     false => self.current_header.consensus_messages.get(digest).unwrap(),
             // };
             
+            let force_slow = self.injected_force_slow_path();
             let qc_maker = self.qc_makers.entry((*slot, digest.clone())).or_insert(QCMaker::new());
             // let qc_maker = match current_instance {
             //     ConsensusMessage::Prepare {slot, view, tc: _, proposals: _, } => self.qc_makers.entry((*slot, digest.clone())).or_insert(QCMaker::new()), //self.pqc_makers.entry((*slot, *view)).or_insert(QCMaker::new()), 
@@ -639,6 +768,7 @@ impl Core {
                 ConsensusMessage::Prepare {slot: _, view: _, tc: _, qc_ticket: _, proposals: _, } => self.use_fast_path,  //Only PrepareQC should try to compute a FastQC
                 _ => false,
             };
+            qc_maker.force_slow = force_slow;
 
             //println!("qc maker weight {:?}", qc_maker.votes.len());
 
@@ -821,6 +951,7 @@ impl Core {
         //Invariant: All votes contain the same content (i.e. it's not the case that some of them carry things like timeouts etc)
         //Wait to form num_active instance many QCs
         
+        let force_slow = self.injected_force_slow_path();
         let qc_maker = self.qc_makers.entry((vote.slot, vote.digest.clone())).or_insert(QCMaker::new());
     
         //Configure qc_maker to try to use Fast Path
@@ -828,6 +959,7 @@ impl Core {
             ConsensusMessage::Prepare {slot: _, view: _, tc: _, qc_ticket: _, proposals: _, } => self.use_fast_path,  //Only PrepareQC should try to compute a FastQC
             _ => false,
         };
+        qc_maker.force_slow = force_slow;
  
         
  
@@ -961,16 +1093,48 @@ impl Core {
 
         debug!("Send req for Consensus message {}", consensus_message);
 
+        // Fault injection is decided here, before the message is consumed:
+        // a targeted leader holds this phase off-loop (see flush_delayed_send).
+        let (slot, view, label) = match &consensus_message {
+            ConsensusMessage::Prepare { slot, view, .. } => (*slot, *view, "Prepare"),
+            ConsensusMessage::Confirm { slot, view, .. } => (*slot, *view, "Confirm"),
+            ConsensusMessage::Commit { slot, view, .. } => (*slot, *view, "Commit"),
+        };
+        let injected = self.injected_consensus_delay(&consensus_message);
+
         let consensus_req = ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
 
         //send to all others
-        let addresses = self
+        let addresses: Vec<SocketAddr> = self
             .committee
             .others_primaries(&self.name)
             .iter()
             .map(|(_, x)| x.primary_to_primary)
             .collect();
         let message = bincode::serialize(&PrimaryMessage::ConsensusRequest(consensus_req.clone())).expect("Failed to serialize timeout message");
+        if let Some(delay) = injected {
+            warn!(
+                "Injecting proposal delay of {} ms on {} for slot {} view {}",
+                delay.as_millis(),
+                label,
+                slot,
+                view
+            );
+            let bytes = Bytes::from(message);
+            self.delayed_sends.push(Box::pin(async move {
+                sleep(delay).await;
+                DelayedSend {
+                    label,
+                    slot,
+                    view,
+                    addresses,
+                    bytes,
+                    kind: DelayedKind::Consensus(consensus_req),
+                }
+            }));
+            return Ok(());
+        }
+
         let handlers = self.network.broadcast(addresses, Bytes::from(message)).await;
 
         self.cancel_handlers
@@ -1111,6 +1275,14 @@ impl Core {
 
                     //println!("The new slot is {:?}", slot + 1);
                     self.already_proposed_slots.insert(slot + 1);
+                    // Record that we are in view 1 of the slot we lead. Followers
+                    // record this when they validate our Prepare; the leader's own
+                    // path skipped it, so the commit-path timer arming below
+                    // (`views.contains_key(slot + k - 1)`) never fired for the slot
+                    // after one we led. With one replica dead that left only two
+                    // live timers for that slot, one short of a TC, and consensus
+                    // stalled for good (CloudLab, high arm phase 4).
+                    self.views.entry(slot + 1).or_insert(1);
                     //self.prepare_tickets.pop_front();
 
                     //TODO: Start measuring consensus latency from here. Measure latency for a slots commit
@@ -1189,6 +1361,14 @@ impl Core {
                                 }
                                 ticket_valid = self.is_valid(&commit_message).await;
                                 debug!("Verify QC Ticket: {}", ticket_valid);
+                                if ticket_valid {
+                                    // A verified CommitQC certifies its proposals as lane tips.
+                                    if let ConsensusMessage::Commit { proposals: ticket_proposals, .. } = &commit_message {
+                                        for (_, proposal) in ticket_proposals {
+                                            self.trusted_tips.insert(proposal.header_digest.clone(), proposal.height);
+                                        }
+                                    }
+                                }
                                 //self.process_commit_message(commit_message, &Header::default()).await.expect("QC Ticket valid"); //TODO: process if unseen..
                             }
                             //if locally committed, do nothing.
@@ -1433,6 +1613,22 @@ impl Core {
                     .primary_to_primary;
                 let bytes = bincode::serialize(&PrimaryMessage::ConsensusVote(vote))
                     .expect("Failed to serialize our own vote");
+                if let Some(delay) = self.injected_vote_delay() {
+                    warn!("Injecting vote delay of {} ms for slot {}", delay.as_millis(), slot);
+                    let bytes = Bytes::from(bytes);
+                    self.delayed_sends.push(Box::pin(async move {
+                        sleep(delay).await;
+                        DelayedSend {
+                            label: "consensus vote",
+                            slot,
+                            view: 0,
+                            addresses: vec![address],
+                            bytes,
+                            kind: DelayedKind::Vote,
+                        }
+                    }));
+                    return Ok(());
+                }
                 let handler = self.network.send(address, Bytes::from(bytes)).await;
                 self.consensus_cancel_handlers
                     .entry(slot) 
@@ -1584,6 +1780,10 @@ impl Core {
                 //update bounding heuristic
                 self.last_committed_slot = max(sl, self.last_committed_slot);
                 self.committed_slots.insert(sl, CommitQC::new(*slot, *view, qc.clone(), proposals.clone()).await);
+                // The commit is verified by the time we get here; its proposals are certified tips.
+                for (_, proposal) in proposals {
+                    self.trusted_tips.insert(proposal.header_digest.clone(), proposal.height);
+                }
                 self.commits_since_last_timeout += 1;
 
 
@@ -1591,7 +1791,7 @@ impl Core {
 
                 if self.k == 1 { //Start timer for next slot
                     if !self.timers.contains(&(slot + self.k, 1)) {
-                        debug!("start timer for slot {}", slot +1);
+                        debug!("start timer for slot {}", slot + self.k);
                         let timer = Timer::new(slot + self.k, 1, self.current_timeout_delay());
                         self.timer_futures.push(Box::pin(timer));
                         self.timers.insert((slot + self.k, 1));
@@ -1599,7 +1799,7 @@ impl Core {
                 }
                 else{ //If slot + k has ticket ready (Prepare from s+k-1 + QC in s)
                     if !self.timers.contains(&(slot + self.k, 1)) && self.views.contains_key(&(slot+self.k -1)) {
-                        debug!("start timer for slot {}", slot +1);
+                        debug!("start timer for slot {}", slot + self.k);
                         let timer = Timer::new(slot + self.k, 1, self.current_timeout_delay());
                         self.timer_futures.push(Box::pin(timer));
                         self.timers.insert((slot + self.k, 1));
@@ -1746,7 +1946,6 @@ impl Core {
 
 
     async fn local_timeout_round(&mut self, slot: Slot, view: View) -> DagResult<()> {
-        warn!("Timeout reached for slot {}, view {}", slot, view);
         //println!("timeout was triggered");
 
         //If timer was cancelled, ignore  -- Note: technically redundant with commit check below, but currently we do not insert CommitQC's... TODO: Need to insert these so we can avoid joining view change and just reply.
@@ -1780,9 +1979,11 @@ impl Core {
             None => {},
         };
 
+        // Only timeouts that survive the checks above are real view changes.
+        warn!("Timeout reached for slot {}, view {}", slot, view);
+
         // A genuine (non-obsolete) view-change timeout: record it for the
-        // learning window and keep the failure controller's leader window
-        // pinned to the leader we are timing out on.
+        // learning window.
         if let Some(learning) = &self.instrumentation.learning {
             learning.record_view_change();
             if self.commits_since_last_timeout == 0 {
@@ -1790,7 +1991,6 @@ impl Core {
             }
         }
         self.commits_since_last_timeout = 0;
-        self.observe_leader_for_injection(slot, view);
 
         debug!("Sending Timeout for slot {}, view {}", slot, view);
         // Make a timeout message.for the slot, view, containing the highest QC this replica has
@@ -1875,7 +2075,6 @@ impl Core {
             self.views.insert(timeout.slot, timeout.view + 1);
 
             // Start the new view timer
-            self.observe_leader_for_injection(tc.slot, tc.view + 1);
             let timer = Timer::new(tc.slot, tc.view + 1, self.current_timeout_delay());
             self.timer_futures.push(Box::pin(timer));
             self.timers.insert((tc.slot, tc.view + 1));
@@ -1977,9 +2176,22 @@ impl Core {
         Ok(())
     }
 
+    /// Height below which a lane's headers and certificates are stale for us:
+    /// that lane's highest known tip minus the gc depth. Lanes are independent
+    /// in Autobahn, so staleness is per lane. A single global round (the
+    /// Narwhal inheritance this replaces) silently rejected every car of a
+    /// lane that had fallen more than gc_depth behind, such as a replica
+    /// returning from an outage.
+    fn lane_gc_floor(&self, lane: &PublicKey) -> Height {
+        self.current_proposal_tips
+            .get(lane)
+            .map_or(0, |tip| tip.height)
+            .saturating_sub(self.gc_depth)
+    }
+
     fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
         ensure!(
-            self.gc_round <= header.height,
+            self.lane_gc_floor(&header.author) <= header.height,
             DagError::HeaderTooOld(header.id.clone(), header.height)
         );
 
@@ -2065,7 +2277,7 @@ impl Core {
 
     fn sanitize_certificate(&mut self, certificate: &Certificate) -> DagResult<()> {
         ensure!(
-            self.gc_round <= certificate.height(),
+            self.lane_gc_floor(&certificate.origin()) <= certificate.height(),
             DagError::CertificateTooOld(certificate.digest(), certificate.height())
         );
 
@@ -2195,6 +2407,9 @@ impl Core {
                 //Fast path loopback for external consensus
                 Some(vote) = self.fast_timer_futures.next() => self.process_consensus_vote(vote, true).await,
 
+                // Fault injection: a held consensus message or vote whose delay elapsed.
+                Some(send) = self.delayed_sends.next() => self.flush_delayed_send(send).await,
+
                 Some((slot, view)) = self.async_timer_futures.next() => {
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony; 
 
@@ -2242,6 +2457,9 @@ impl Core {
             let round = self.consensus_round.load(Ordering::Relaxed);
             if round > self.gc_depth {
                 let gc_round = round - self.gc_depth;
+                // last_voted is keyed by height across all lanes; a lane that
+                // lags loses its duplicate-vote guard here. Only an
+                // equivocating author could exploit that, so it is left as is.
                 self.last_voted.retain(|k, _| k >= &gc_round);
                 //self.processing.retain(|k, _| k >= &gc_round);
 
@@ -2249,7 +2467,11 @@ impl Core {
                 //self.vote_aggregators.retain(|k, _| k >= &gc_round);
 
                 //self.certificates_aggregators.retain(|k, _| k >= &gc_round);
-                self.cancel_handlers.retain(|k, _| k >= &gc_round);
+                // cancel_handlers hold our OWN header broadcasts, keyed by our
+                // lane height, so they retire against our own lane's floor.
+                let own_floor = self.lane_gc_floor(&self.name);
+                self.cancel_handlers.retain(|k, _| k >= &own_floor);
+                self.trusted_tips.retain(|_, height| *height >= gc_round);
                 self.gc_round = gc_round;
                 debug!("GC round moved to {}", self.gc_round);
             }

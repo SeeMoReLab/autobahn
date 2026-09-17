@@ -7,7 +7,7 @@ use crate::messages::{Block, Timeout, Vote, QC, TC};
 use crate::synchronizer::Synchronizer;
 use crate::timer::Timer;
 use adaptive::episode::LearningManager;
-use adaptive::failure::ProposalDelayController;
+use adaptive::failure::FaultController;
 use adaptive::timeouts::TimeoutCell;
 use async_recursion::async_recursion;
 use crypto::Hash as _;
@@ -46,7 +46,9 @@ pub struct CommittedBlock {
 pub struct Instrumentation {
     pub timeout_cell: TimeoutCell,
     pub learning: Option<Arc<LearningManager>>,
-    pub proposal_delay: Arc<ProposalDelayController>,
+    /// Protocol fault injection (proposal delays keyed by this replica's
+    /// global id).
+    pub faults: Arc<FaultController>,
     pub replica_id: u32,
     pub replica_of: HashMap<PublicKey, u32>,
 }
@@ -58,7 +60,7 @@ impl Instrumentation {
         Self {
             timeout_cell: TimeoutCell::new(std::time::Duration::from_millis(timeout_delay_ms)),
             learning: None,
-            proposal_delay: Arc::new(ProposalDelayController::disabled()),
+            faults: Arc::new(FaultController::disabled()),
             replica_id: 0,
             replica_of: HashMap::new(),
         }
@@ -95,14 +97,20 @@ pub struct Core {
     timer: Timer,
     aggregator: Aggregator,
     instrumentation: Instrumentation,
-    replica_ids: Vec<u32>,
     first_seen: HashMap<Digest, Instant>,
     commits_since_last_timeout: u64,
     /// Completed payload fetches for proposals, fed by MempoolDriver::get
     /// waiter tasks (never by the network).
     rx_payload: Receiver<crate::mempool::ProposalPayload>,
-    /// The round a payload fetch is outstanding for, to avoid stacking.
+    /// The round a payload fetch is outstanding for, to avoid stacking. It
+    /// stays set while an injected proposal delay is pending, so no second
+    /// fetch (and no second block) is produced for that round.
     payload_inflight: Option<RoundNumber>,
+    /// Fault injection: proposals whose injected delay has elapsed, fed back
+    /// by the sleep tasks spawned in complete_proposal so the core never
+    /// blocks and keeps voting while its own proposal is held.
+    tx_delayed_proposal: Sender<crate::mempool::ProposalPayload>,
+    rx_delayed_proposal: Receiver<crate::mempool::ProposalPayload>,
 }
 
 impl Core {
@@ -124,8 +132,7 @@ impl Core {
     ) -> Self {
         let aggregator = Aggregator::new(committee.clone());
         let timer = Timer::new(parameters.timeout_delay);
-        let mut replica_ids: Vec<u32> = instrumentation.replica_of.values().copied().collect();
-        replica_ids.sort_unstable();
+        let (tx_delayed_proposal, rx_delayed_proposal) = tokio::sync::mpsc::channel(100);
         Self {
             name,
             committee,
@@ -146,11 +153,12 @@ impl Core {
             timer,
             aggregator,
             instrumentation,
-            replica_ids,
             first_seen: HashMap::new(),
             commits_since_last_timeout: 0,
             rx_payload,
             payload_inflight: None,
+            tx_delayed_proposal,
+            rx_delayed_proposal,
         }
     }
 
@@ -375,35 +383,45 @@ impl Core {
     }
 
     /// A payload fetch finished; build, broadcast, and process the block if
-    /// we are still in the round it was requested for.
+    /// we are still in the round it was requested for. `resumed` marks a
+    /// payload coming back from an injected proposal delay.
     async fn complete_proposal(
         &mut self,
         round: RoundNumber,
         tc: Option<TC>,
         payload: Vec<Digest>,
+        resumed: bool,
     ) -> ConsensusResult<()> {
-        self.payload_inflight = None;
         if round != self.round || self.name != self.leader_elector.get_leader(self.round) {
+            self.payload_inflight = None;
             debug!("Discarding stale proposal payload for round {}", round);
             return Ok(());
         }
 
-        // Protocol failure injection: a targeted leader delays its proposal.
-        // Sleeping here intentionally stalls the whole core, which is the
-        // point of the fault.
-        let injected_delay = self.instrumentation.proposal_delay.delay_for_proposal(
-            self.instrumentation.replica_id,
-            self.instrumentation.replica_id,
-            &self.replica_ids,
-        );
-        if injected_delay > std::time::Duration::ZERO {
-            warn!(
-                "Injecting proposal delay of {} ms in round {}",
-                injected_delay.as_millis(),
-                self.round
-            );
-            sleep(injected_delay).await;
+        // Protocol fault injection: a targeted leader delays its proposal.
+        // The sleep runs off the core loop so this replica keeps voting and
+        // timing out like everyone else; only its own proposal is late.
+        // payload_inflight stays set meanwhile so the round is not proposed
+        // twice.
+        if !resumed {
+            if let Some(fault) = self.instrumentation.faults.proposal_fault(self.instrumentation.replica_id) {
+                let delay = fault.delay.resolve(self.instrumentation.timeout_cell.get());
+                if delay > Duration::ZERO {
+                    warn!(
+                        "Injecting proposal delay of {} ms in round {}",
+                        delay.as_millis(),
+                        self.round
+                    );
+                    let tx = self.tx_delayed_proposal.clone();
+                    tokio::spawn(async move {
+                        sleep(delay).await;
+                        let _ = tx.send((round, tc, payload)).await;
+                    });
+                    return Ok(());
+                }
+            }
         }
+        self.payload_inflight = None;
 
         // Make a new block.
         let block = Block::new(
@@ -599,7 +617,11 @@ impl Core {
                     }
                 },
                 Some((round, tc, payload)) = self.rx_payload.recv() => {
-                    self.complete_proposal(round, tc, payload).await
+                    self.complete_proposal(round, tc, payload, false).await
+                },
+                // A proposal whose injected delay has elapsed.
+                Some((round, tc, payload)) = self.rx_delayed_proposal.recv() => {
+                    self.complete_proposal(round, tc, payload, true).await
                 },
                 () = &mut self.timer => self.local_timeout_round().await,
                 else => break,

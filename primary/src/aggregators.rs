@@ -87,6 +87,10 @@ pub struct QCMaker {
     used: HashSet<PublicKey>,
 
     pub try_fast: bool,  //TODO: Configure it for Fast path (if it's a Quorummaker for Prepare)
+    /// Fault injection: never complete the fast QC even with all n votes, so
+    /// the fast-path timer expires and the slow QC is used. A leader that
+    /// still waits for unanimity but then pretends it never arrived.
+    pub force_slow: bool,
     qc_dig: Digest, 
     first: bool,          //Indicate when SlowQC is first ready -> I.e. only start ONE timer.
     completed_fast: bool, //Indicate whether or not we succeeded on Fast Path. This stops timer that loopbacks from re-submitting QC
@@ -102,6 +106,7 @@ impl QCMaker {
             qc_dig: Digest::default(),
             first: true, 
             completed_fast: false,
+            force_slow: false,
         }
     }
 
@@ -133,7 +138,7 @@ impl QCMaker {
     }
 
     pub fn check_fast_qc(&mut self, vote_dig: Digest, committee: &Committee) -> DagResult<(bool, Option<QC>)> {
-        if self.weight >= committee.fast_threshold() {
+        if !self.force_slow && self.weight >= committee.fast_threshold() {
             // Ensure QC is only made once.
             self.weight = 0; 
             self.completed_fast = true;

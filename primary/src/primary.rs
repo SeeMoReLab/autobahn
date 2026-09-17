@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use store::Store;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender};
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -84,11 +84,10 @@ pub struct Primary;
 pub struct PrimaryInstrumentation {
     pub timeout_delay: adaptive::timeouts::TimeoutCell,
     pub fast_path_timeout: adaptive::timeouts::TimeoutCell,
-    /// Wired for contract uniformity; the current engine never arms a timer
-    /// from car_timeout.
-    pub car_timeout: adaptive::timeouts::TimeoutCell,
     pub learning: Option<std::sync::Arc<adaptive::episode::LearningManager>>,
-    pub proposal_delay: std::sync::Arc<adaptive::failure::ProposalDelayController>,
+    /// Protocol fault injection (proposal and vote delays keyed by this
+    /// replica's global id).
+    pub faults: std::sync::Arc<adaptive::failure::FaultController>,
     pub first_seen:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Digest, std::time::Instant>>>,
     pub replica_id: u32,
@@ -107,13 +106,8 @@ impl PrimaryInstrumentation {
             fast_path_timeout: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
                 parameters.fast_path_timeout,
             )),
-            car_timeout: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
-                parameters.car_timeout,
-            )),
             learning: None,
-            proposal_delay: std::sync::Arc::new(
-                adaptive::failure::ProposalDelayController::disabled(),
-            ),
+            faults: std::sync::Arc::new(adaptive::failure::FaultController::disabled()),
             first_seen: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -146,13 +140,18 @@ impl Primary {
         let (tx_headers, rx_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_certificates, rx_sync_certificates) = channel(CHANNEL_CAPACITY);
-        let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
+        // Unbounded on purpose: the header waiter delivers into these while the
+        // core may be blocked on its own bounded send to the header waiter
+        // (synchronizer sync requests). Bounded channels on both legs deadlock
+        // under a dead peer (observed on CloudLab, 2026-09-16). Volume is
+        // bounded by the requests the core itself issued.
+        let (tx_headers_loopback, rx_headers_loopback) = unbounded_channel();
         let (tx_certificates_loopback, _rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_header_requests, rx_header_requests) = channel(CHANNEL_CAPACITY);
         let (tx_instance, rx_instance) = channel(CHANNEL_CAPACITY);
-        let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
+        let (tx_header_waiter_instances, rx_header_waiter_instances) = unbounded_channel();
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
 
@@ -227,11 +226,6 @@ impl Primary {
         // use_ride_share: bool,
         // car_timeout: u64,
 
-        // Clones for the proposer, extracted before the instrumentation moves
-        // into the core.
-        let proposal_delay_for_proposer = std::sync::Arc::clone(&instrumentation.proposal_delay);
-        let proposer_replica_id = instrumentation.replica_id;
-
         // The `Core` receives and handles headers, votes, and certificates from the other primaries.
         Core::spawn(
             name,
@@ -257,14 +251,17 @@ impl Primary {
             parameters.use_fast_path,
             parameters.fast_path_timeout,
             parameters.use_ride_share,
-            parameters.car_timeout,
             parameters.simulate_asynchrony,
             parameters.asynchrony_start,
             parameters.asynchrony_duration,
             instrumentation,
         );
 
-        Committer::spawn(committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);
+        // A replica that was cut off for longer than the garbage-collection
+        // window can never receive the slots it missed. Two sync retries is
+        // long enough for any legitimate sync to complete first.
+        let catch_up_wait = Duration::from_millis(2 * parameters.sync_retry_delay);
+        Committer::spawn(committee.clone(), store.clone(), parameters.gc_depth, catch_up_wait, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
         GarbageCollector::spawn(
@@ -286,8 +283,6 @@ impl Primary {
             name,
             committee.clone(),
             store.clone(),
-            consensus_round,
-            parameters.gc_depth,
             parameters.sync_retry_delay,
             parameters.sync_retry_nodes,
             /* rx_synchronizer */ rx_sync_headers,
@@ -315,8 +310,6 @@ impl Primary {
             /* rx_workers */ rx_our_digests,
             /* rx_ticket */ rx_instance,
             /* tx_core */ tx_headers,
-            proposal_delay_for_proposer,
-            proposer_replica_id,
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.

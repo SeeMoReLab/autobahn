@@ -11,7 +11,7 @@ use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use env_logger::Env;
 use adaptive::episode::{autobahn_hooks, LearningConfig, LearningManager};
-use adaptive::failure::{ProposalDelayController, ProtocolSection};
+use adaptive::failure::{FaultController, ProtocolSection};
 use adaptive::metrics::LearningSample;
 use adaptive::timeouts::AutobahnTimeoutCells;
 use network::SimpleSender;
@@ -162,10 +162,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         ("primary", _) => {
             let cells = AutobahnTimeoutCells::new(
                 Duration::from_millis(parameters.timeout_delay),
-                Duration::from_millis(parameters.car_timeout),
                 Duration::from_millis(parameters.fast_path_timeout),
             );
-            let proposal_delay = match (
+            let faults = match (
                 matches.value_of("failure-spec"),
                 parse_u64("failure-start-unix-ms")?,
             ) {
@@ -175,7 +174,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                         "--failure-spec requires --replica-map"
                     );
                     Arc::new(
-                        ProposalDelayController::load_file(
+                        FaultController::load_file(
                             spec,
                             start_ms,
                             ProtocolSection::Autobahn,
@@ -186,7 +185,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 (Some(_), None) => {
                     anyhow::bail!("--failure-spec requires --failure-start-unix-ms")
                 }
-                _ => Arc::new(ProposalDelayController::disabled()),
+                _ => Arc::new(FaultController::disabled()),
             };
             let learning = if matches.is_present("learning") {
                 anyhow::ensure!(!replica_of.is_empty(), "--learning requires --replica-map");
@@ -215,9 +214,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let instrumentation = PrimaryInstrumentation {
                 timeout_delay: cells.timeout_delay.clone(),
                 fast_path_timeout: cells.fast_path_timeout.clone(),
-                car_timeout: cells.car_timeout.clone(),
                 learning,
-                proposal_delay,
+                faults,
                 first_seen: Arc::clone(&first_seen),
                 replica_id,
                 replica_of: replica_of.clone(),
