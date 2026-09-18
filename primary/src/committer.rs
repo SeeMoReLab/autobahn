@@ -203,9 +203,21 @@ impl Committer {
         if since.elapsed() < self.catch_up_wait {
             return;
         }
-        let Some(&target) = state.log.keys().min() else { return };
+        // Close EVERY dead gap in one pass, executing what is executable in
+        // between. Adopting only the oldest gap per `catch_up_wait` makes a
+        // replica that missed many slots crawl forward slower than the network
+        // produces new ones, so it never returns to real time and never acks
+        // its own clients again.
+        while self.skip_one_gap(state, since).await {}
+    }
+
+    /// Adopt the oldest logged commit as executed, skipping the slots missing
+    /// before it, then execute everything that became ready. Returns false when
+    /// the log holds no further gap.
+    async fn skip_one_gap(&mut self, state: &mut State, since: Instant) -> bool {
+        let Some(&target) = state.log.keys().min() else { return false };
         if target <= state.last_executed_slot + 1 {
-            return;
+            return false;
         }
         let commit_message = state.log.remove(&target).unwrap();
         if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = &commit_message {
@@ -227,6 +239,7 @@ impl Committer {
         state.last_executed_slot = target;
         state.stall_since = None;
         self.execute_ready(state).await;
+        true
     }
 
     async fn run(&mut self) {

@@ -29,6 +29,13 @@ use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const CONNECT_RETRY: Duration = Duration::from_millis(200);
+/// A single write blocked this long means the front is gone or hopelessly
+/// behind. The kernel will not tell us: after a partition of more than a few
+/// seconds TCP's retransmission timer has backed off to a minute or more, so
+/// a lane stays idle long after the network is healed. This is also exactly
+/// the point past which the transaction is counted as an error anyway, so
+/// giving up on the socket costs nothing that was not already lost.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 /// Sender pacing frequency: each lane sends its allotment this many times
 /// per second.
@@ -283,23 +290,14 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
                 let front = conn_index / cfg.connections_per_target;
                 let outstanding: Arc<Mutex<HashMap<u64, Instant>>> =
                     Arc::new(Mutex::new(HashMap::new()));
-                let (sink, stream) = framed.split();
                 let target = cfg.targets[front];
 
                 tasks.push(tokio::spawn(sender(
-                    sink,
+                    framed,
                     target,
                     per_sender_rate,
                     cfg.tx_size,
                     cfg.target_mode,
-                    front,
-                    Arc::clone(&leader_index),
-                    Arc::clone(&outstanding),
-                    Arc::clone(&metrics),
-                )));
-                tasks.push(tokio::spawn(receiver(
-                    stream,
-                    target,
                     front,
                     Arc::clone(&tracker),
                     Arc::clone(&leader_index),
@@ -505,16 +503,27 @@ impl LanePacer {
 
 #[allow(clippy::too_many_arguments)]
 async fn sender(
-    mut sink: TxSink,
+    framed: Framed<TcpStream, LengthDelimitedCodec>,
     target: SocketAddr,
     rate: f64,
     tx_size: usize,
     target_mode: TargetMode,
     front: usize,
+    tracker: Arc<Mutex<LeaderTracker>>,
     leader_index: Arc<AtomicUsize>,
     outstanding: Arc<Mutex<HashMap<u64, Instant>>>,
     metrics: Arc<BenchmarkMetrics>,
 ) {
+    let (mut sink, stream) = framed.split();
+    tokio::spawn(receiver(
+        stream,
+        target,
+        front,
+        Arc::clone(&tracker),
+        Arc::clone(&leader_index),
+        Arc::clone(&outstanding),
+        Arc::clone(&metrics),
+    ));
     let tick_period = Duration::from_millis(1000 / PRECISION);
     let mut interval = tokio::time::interval(tick_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -545,11 +554,42 @@ async fn sender(
             tx.put_u64(seq);
             tx.resize(tx_size, 0u8);
             outstanding.lock().unwrap().insert(seq, Instant::now());
-            if let Err(err) = sink.send(tx.freeze()).await {
-                client_println!("connection to {} failed: {}", target, err);
-                // Everything still outstanding on this connection will be
-                // counted as errors by the sweeper.
-                return;
+            let outcome = match tokio::time::timeout(WRITE_STALL_TIMEOUT, sink.send(tx.freeze())).await {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(format!("{}", err)),
+                Err(_) => Some(format!("blocked for {:?}", WRITE_STALL_TIMEOUT)),
+            };
+            if let Some(err) = outcome {
+                // A partition (or a replica restart) destroys this socket.
+                // Everything still outstanding on it is counted as an error
+                // by the sweeper, but the lane itself must come back: a real
+                // client reconnects, and without that this benchmark
+                // permanently stops offering this front its share of the
+                // load, which caps throughput at (n-1)/n forever.
+                client_println!("connection to {} failed: {}; reconnecting", target, err);
+                let stream = match connect_with_retry(target).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        client_println!("lane to {} could not reconnect: {}", target, err);
+                        return;
+                    }
+                };
+                let (new_sink, new_stream) = Framed::new(stream, LengthDelimitedCodec::new()).split();
+                sink = new_sink;
+                tokio::spawn(receiver(
+                    new_stream,
+                    target,
+                    front,
+                    Arc::clone(&tracker),
+                    Arc::clone(&leader_index),
+                    Arc::clone(&outstanding),
+                    Arc::clone(&metrics),
+                ));
+                client_println!("lane to {} reconnected", target);
+                // Drop the rest of this burst and resume pacing from now, so
+                // the outage is not replayed as one giant burst.
+                pacer.idle(Instant::now());
+                break;
             }
         }
         let _ = &metrics; // metrics are recorded by receiver and sweeper

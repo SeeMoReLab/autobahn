@@ -9,7 +9,7 @@ use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
-use log::debug;
+use log::{debug, warn};
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -256,18 +256,62 @@ impl Synchronizer {
         // NOTE: Before calling, must check if proposal is ready, assumes that proposal is ready
         // before calling
         debug!("proposal height is {:?}", proposal.height);
-        let mut header: Header = self.get_header(proposal.header_digest).await.expect("already synced should have header").unwrap();
+        let mut header: Header = match self.get_header(proposal.header_digest.clone()).await? {
+            Some(header) => header,
+            None => {
+                // The committer only reaches a proposal whose tip the core has
+                // stored, so this is a hole the lane will never fill. Skipping
+                // it loses output; panicking here kills the committer task and
+                // with it every future commit on this replica.
+                warn!(
+                    "Executing a commit whose tip {} is not stored; skipping it",
+                    proposal.header_digest
+                );
+                return Ok(ancestors);
+            }
+        };
 
         // Otherwise we have the header and all of its ancestors
         let mut current_height = proposal.height;
         while current_height > stop_height {
             debug!("current height is {:?}, stop height is {:?}", current_height, stop_height);
             ancestors.push(header.clone());
-            header = self.get_parent_header(&header).await?.expect("should have parent by now");
+            header = match self.stored_parent_header(&header).await? {
+                Some(parent) => parent,
+                None => {
+                    // A replica that was cut off adopts lane heights it never
+                    // walked down to (committer catch-up), so the chain below
+                    // the tip has holes its peers have garbage collected.
+                    // Execute what is stored rather than crashing.
+                    warn!(
+                        "Lane {} has no stored ancestor below height {}; executing from there",
+                        header.author, current_height
+                    );
+                    break;
+                }
+            };
             current_height = header.height();
         }
 
         Ok(ancestors)
+    }
+
+    /// The parent header, but only if it is already stored. Unlike
+    /// `get_parent_header` this never issues a sync request: the committer
+    /// walks the ancestors of an already committed proposal, and a request
+    /// there can never be answered by peers that have garbage collected it.
+    pub async fn stored_parent_header(&mut self, header: &Header) -> DagResult<Option<Header>> {
+        let genesis = self
+            .genesis_headers
+            .get(&header.author)
+            .expect("every lane has a genesis header");
+        if header.parent_cert.header_digest == genesis.digest() {
+            return Ok(Some(genesis.clone()));
+        }
+        match self.store.read(header.parent_cert.header_digest.to_vec()).await? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn get_parent_header(&mut self, header: &Header) -> DagResult<Option<Header>> {

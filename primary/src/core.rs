@@ -485,15 +485,23 @@ impl Core {
         // then adopts such tips as already executed (committer catch-up), so
         // it never needs their batches, and fetching them (gigabytes for a
         // long gap) would saturate its worker and stall every peer's batch
-        // maker. A healthy replica must keep the normal path: a committed tip
-        // whose batches are still in flight has to wait for them, otherwise
-        // the committer outputs a header nobody can execute.
-        let known_height = self
-            .current_proposal_tips
-            .get(&header.origin())
-            .map_or(0, |tip| tip.height);
-        let trusted_tip = self.trusted_tips.contains_key(&header.digest())
-            && header.height() > known_height + self.gc_depth;
+        // maker.
+        //
+        // This must NOT be narrowed to "only when far behind". A replica
+        // catching up raises its known tip for the lane as it goes, so such a
+        // test flips false partway through the catch-up and the remaining tips
+        // fall back to the normal path - demanding a payload whose batches the
+        // peers have long since garbage collected. The tip is then never
+        // stored, `get_proposals` below never completes, the commit is never
+        // handed to the committer, and the replica stops executing for good.
+        //
+        // Reaching here at all means the header arrived after its CommitQC. On
+        // a healthy replica that does not happen: the car is broadcast well
+        // before it is committed, so it is already stored by the normal path
+        // (payload and all) and this branch is never taken. It is the replica
+        // that missed the broadcast which needs the tip, and for it the
+        // CommitQC is the only proof available and a sufficient one.
+        let trusted_tip = self.trusted_tips.contains_key(&header.digest());
 
         // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
         // reschedule processing of this header once we have it.
@@ -503,13 +511,23 @@ impl Core {
             return Ok(());
         }
 
-        // By FIFO should have parent of this header (and recursively all ancestors), reschedule for processing if we don't
-        if self
-            .synchronizer
-            .get_parent_header(&header)
-            .await?
-            .is_none()
-        {
+        // By FIFO should have parent of this header (and recursively all ancestors), reschedule for processing if we don't.
+        //
+        // For a trusted tip we only LOOK for the parent, never request it. A
+        // tip a CommitQC names is already committed by a quorum, and asking
+        // for its parent walks the whole outage backwards - every header and
+        // every batch of the gap. That walk cannot terminate: once it reaches
+        // heights below the lane's gc floor the ancestors come back and are
+        // rejected as too old, so the request is reissued forever. While it
+        // runs, this commit is never handed to the committer (see the
+        // `get_proposals` gate below), so a returning replica never executes
+        // anything again and never acks its own clients.
+        let parent_stored = if trusted_tip {
+            self.synchronizer.stored_parent_header(&header).await?.is_some()
+        } else {
+            self.synchronizer.get_parent_header(&header).await?.is_some()
+        };
+        if !parent_stored {
             if trusted_tip {
                 warn!(
                     "Storing header {} (height {}) without its parent or payload: a CommitQC names it as a lane tip (catch-up after a gap)",

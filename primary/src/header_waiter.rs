@@ -23,6 +23,16 @@ use tokio::time::{sleep, Duration, Instant};
 /// new sync requests if we didn't.
 const TIMER_RESOLUTION: u64 = 1_000;
 
+/// How many payload waits may be escalated into batch requests at once.
+///
+/// Escalation repairs an *isolated* batch that dissemination dropped. When
+/// many payloads are missing at the same time nothing was dropped: we are
+/// simply behind, and the committer's catch-up is what resolves that. Asking
+/// for every batch of the gap instead buries our own worker and the peers we
+/// ask - measured, a returning replica issued 23894 batch requests and
+/// collapsed, while the healthy replicas needed 2 apiece.
+const MAX_ESCALATIONS_IN_FLIGHT: usize = 16;
+
 /// A pending sync request is abandoned after this many sync retry delays.
 const SYNC_EXPIRY_RETRIES: u128 = 6;
 
@@ -73,8 +83,12 @@ pub struct HeaderWaiter {
     network: SimpleSender,
 
     /// Keeps the digests of the all certificates for which we sent a sync request,
-    /// along with a timestamp (`u128`) indicating when we sent the request.
-    parent_requests: HashMap<Digest, (Height, u128)>,
+    /// along with when the request was first made and when it was last retried.
+    /// The two are distinct: the first bounds how long we keep waiting before
+    /// abandoning the sync, the second spaces the retries. Using one field for
+    /// both means a retried request either never expires or is retried on
+    /// every timer tick.
+    parent_requests: HashMap<Digest, (Height, u128, u128)>,
     //same, but for special parents
     header_requests: HashMap<Digest, (Height, u128)>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
@@ -83,6 +97,14 @@ pub struct HeaderWaiter {
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (u128, Sender<()>)>,
+    /// Headers whose payload we are waiting for without having asked anyone for
+    /// it, with the batches still missing, their author, and when the wait
+    /// started. Batch dissemination is best effort (`SimpleSender`, no
+    /// retransmission), so a batch dropped by a partition or a full queue never
+    /// arrives on its own: without an escalation the header can never be voted
+    /// on and its lane stalls for good. `escalate_payload_waits` turns these
+    /// into real requests once they are older than `sync_retry_delay`.
+    payload_waits: HashMap<Digest, (u128, HashMap<Digest, WorkerId>, PublicKey)>,
 }
 
 impl HeaderWaiter {
@@ -113,6 +135,7 @@ impl HeaderWaiter {
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending: HashMap::new(),
+                payload_waits: HashMap::new(),
             }
             .run()
             .await;
@@ -121,6 +144,59 @@ impl HeaderWaiter {
 
     /// Helper function. It waits for particular data to become available in the storage
     /// and then delivers the specified header.
+    /// Ask our own worker to fetch these batches from the author's worker.
+    /// `batch_requests` dedupes per digest, so asking twice for the same batch
+    /// costs nothing.
+    async fn request_batches(&mut self, missing: HashMap<Digest, WorkerId>, author: PublicKey) {
+        let mut requires_sync = HashMap::new();
+        for (digest, worker_id) in missing.into_iter() {
+            self.batch_requests.entry(digest.clone()).or_insert_with(|| {
+                requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
+                now_ms()
+            });
+        }
+        for (worker_id, digests) in requires_sync {
+            let address = self
+                .committee
+                .worker(&self.name, &worker_id)
+                .expect("Author of valid header is not in the committee")
+                .primary_to_worker;
+            debug!("Sent syncbatches message for {} digests", digests.len());
+            let message = PrimaryWorkerMessage::Synchronize(digests, author);
+            let bytes = bincode::serialize(&message).expect("Failed to serialize batch sync request");
+            self.network.send(address, Bytes::from(bytes)).await;
+        }
+    }
+
+    /// Turn payload waits older than `sync_retry_delay` into real requests.
+    /// A batch that has not arrived by then was not merely slow: dissemination
+    /// dropped it, and nothing will resend it unasked.
+    async fn escalate_payload_waits(&mut self) {
+        let now = now_ms();
+        let delay = self.sync_retry_delay as u128;
+        let due: Vec<Digest> = self
+            .payload_waits
+            .iter()
+            .filter(|(_, (since, _, _))| since + delay < now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if due.len() > MAX_ESCALATIONS_IN_FLIGHT {
+            // Bulk catch-up, not a dropped batch: leave these to the committer
+            // and stop tracking them so they do not pile up.
+            debug!("{} payload waits overdue at once; leaving them to catch-up", due.len());
+            for id in due {
+                let _ = self.payload_waits.remove(&id);
+            }
+            return;
+        }
+        for id in due {
+            if let Some((_, missing, author)) = self.payload_waits.remove(&id) {
+                debug!("Escalating payload wait for header {} to a batch request", id);
+                self.request_batches(missing, author).await;
+            }
+        }
+    }
+
     async fn waiter(
         mut missing: Vec<(Vec<u8>, Store)>,
         deliver: Header,
@@ -171,6 +247,7 @@ impl HeaderWaiter {
                         WaiterMessage::SyncBatches(missing, header, force_sync) => {
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();
+                            let header_id_for_wait = header.id.clone();
                             let round = header.height;
                             let author = header.author;
 
@@ -194,25 +271,13 @@ impl HeaderWaiter {
                             waiting.push(fut);
 
                             if force_sync {
-                                // Ensure we didn't already send a sync request for these parents.
-                                let mut requires_sync = HashMap::new();
-                                for (digest, worker_id) in missing.into_iter() {
-                                    self.batch_requests.entry(digest.clone()).or_insert_with(|| {
-                                        requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
-                                        now_ms()
-                                    });
-                                }
-                                for (worker_id, digests) in requires_sync {
-                                    let address = self.committee
-                                        .worker(&self.name, &worker_id)
-                                        .expect("Author of valid header is not in the committee")
-                                        .primary_to_worker;
-                                    debug!("Sent syncbatches message for height {}", round);
-                                    let message = PrimaryWorkerMessage::Synchronize(digests, author);
-                                    let bytes = bincode::serialize(&message)
-                                        .expect("Failed to serialize batch sync request");
-                                    self.network.send(address, Bytes::from(bytes)).await;
-                                }
+                                self.request_batches(missing, author).await;
+                            } else {
+                                // Wait for the batches to arrive on their own,
+                                // which is the common case and costs nothing.
+                                // If they do not, the timer escalates this to
+                                // a real request; see `payload_waits`.
+                                self.payload_waits.insert(header_id_for_wait, (now_ms(), missing, author));
                             }
                         }
 
@@ -273,7 +338,7 @@ impl HeaderWaiter {
                             let mut requires_sync = Vec::new();
                             self.parent_requests.entry(missing.clone()).or_insert_with(|| {
                                 requires_sync.push(missing);
-                                (height, now)
+                                (height, now, now)
                             });
                             if !requires_sync.is_empty() {
                                 let address = self.committee
@@ -323,7 +388,7 @@ impl HeaderWaiter {
                             for missing in missing {
                                 self.parent_requests.entry(missing.header_digest.clone()).or_insert_with(|| {
                                     requires_sync.push(missing.header_digest);
-                                    (missing.height, now)
+                                    (missing.height, now, now)
                                 });
                             }
                             if !requires_sync.is_empty() {
@@ -343,6 +408,7 @@ impl HeaderWaiter {
                     Ok(Some(header)) => {
                         debug!("Finished synching {:?}", header);
                         let _ = self.pending.remove(&header.id);
+                        let _ = self.payload_waits.remove(&header.id);
                         for x in header.payload.keys() {
                             let _ = self.batch_requests.remove(x);
                         }
@@ -413,16 +479,29 @@ impl HeaderWaiter {
 
                     //Retry CertificateRequests
                     let mut retry = Vec::new();
-                    for (digest, (_, timestamp)) in &self.parent_requests {
-                        if timestamp + (self.sync_retry_delay as u128) < now {
+                    for (digest, (_, _, last_retry)) in &self.parent_requests {
+                        if last_retry + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting retry sync for parent header {} (retry)", digest);
                             retry.push(digest.clone());
+                        }
+                    }
+                    // Record the retry. Without this the timer (which ticks
+                    // every TIMER_RESOLUTION) re-broadcasts every overdue
+                    // request on every tick instead of once per
+                    // sync_retry_delay, so one slow sync turns into a flood.
+                    // Only `last_retry` moves: the creation time below still
+                    // decides when the sync is abandoned.
+                    for digest in &retry {
+                        if let Some((_, _, last_retry)) = self.parent_requests.get_mut(digest) {
+                            *last_retry = now;
                         }
                     }
                     let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
                     let message = PrimaryMessage::HeadersRequest(retry, self.name);
                     let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                     self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+
+                    self.escalate_payload_waits().await;
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
@@ -438,8 +517,9 @@ impl HeaderWaiter {
                 }
             }
             self.pending.retain(|_, (since, _)| *since + expiry >= now);
+            self.payload_waits.retain(|_, (since, _, _)| *since + expiry >= now);
             self.batch_requests.retain(|_, since| *since + expiry >= now);
-            self.parent_requests.retain(|_, (_, since)| *since + expiry >= now);
+            self.parent_requests.retain(|_, (_, since, _)| *since + expiry >= now);
             self.header_requests.retain(|_, (_, since)| *since + expiry >= now);
         }
     }
