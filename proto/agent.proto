@@ -88,6 +88,14 @@ message SbftReport {
     // this window. Zero for both until the engine attributes paths.
     uint32 fast_path_count = 21;
     uint32 slow_path_count = 22;
+    // Measured only by the replica that led each sequence: over the sequences
+    // it led in this window, the median time from the 2f+1-th to the n-th
+    // prepare (the fast-path wait that would have caught it) among those whose
+    // n-th prepare arrived by execution, and the counts with and without it.
+    // Zero on a replica that led nothing.
+    float nth_prepare_gap_ms = 23;
+    uint32 nth_prepare_seen_count = 24;
+    uint32 nth_prepare_unseen_count = 25;
 }
 
 message TendermintReport {
