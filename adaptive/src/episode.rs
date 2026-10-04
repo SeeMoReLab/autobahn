@@ -117,20 +117,18 @@ pub fn hotstuff_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
     }
 }
 
-/// Ready-made hooks for Autobahn: two knobs (timeout_delay and
-/// fast_path_timeout); `timeout_ms` reports the view-change timeout_delay.
-/// The proto's car_timeout field is sent as 0 and ignored on receipt: the
-/// engine has no timer that reads it.
-pub fn autobahn_hooks(cells: crate::timeouts::AutobahnTimeoutCells) -> ProtocolHooks {
-    let as_ms = |cell: &crate::timeouts::TimeoutCell| {
-        cell.get().as_millis().min(u32::MAX as u128) as u32
-    };
+/// Ready-made hooks for Autobahn: a single knob, the per-slot view-change
+/// timeout_delay, written to `cell`. The proto's car_timeout and
+/// fast_path_timeout fields are sent as 0 and must be 0 on receipt: the
+/// engine has no timer that reads car_timeout, and fast_path_timeout is a
+/// fixed parameter (parameters.json), not an action.
+pub fn autobahn_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
     let initial = pb::AutobahnTimeout {
-        timeout_delay_milliseconds: as_ms(&cells.timeout_delay),
+        timeout_delay_milliseconds: cell.get().as_millis().min(u32::MAX as u128) as u32,
         car_timeout_milliseconds: 0,
-        fast_path_timeout_milliseconds: as_ms(&cells.fast_path_timeout),
+        fast_path_timeout_milliseconds: 0,
     };
-    let apply_cells = cells.clone();
+    let apply_cell = cell.clone();
     ProtocolHooks {
         protocol: pb::Protocol::Autobahn,
         initial_timeout: pb::timeout::Value::Autobahn(initial),
@@ -150,15 +148,13 @@ pub fn autobahn_hooks(cells: crate::timeouts::AutobahnTimeoutCells) -> ProtocolH
         }),
         apply_timeout: Box::new(move |value| match value {
             pb::timeout::Value::Autobahn(t) => {
-                if t.timeout_delay_milliseconds == 0 || t.fast_path_timeout_milliseconds == 0 {
-                    bail!("non-positive Autobahn timeout component: {:?}", t);
+                if t.timeout_delay_milliseconds == 0 {
+                    bail!("non-positive timeout delay");
                 }
-                apply_cells
-                    .timeout_delay
-                    .set(Duration::from_millis(t.timeout_delay_milliseconds as u64));
-                apply_cells
-                    .fast_path_timeout
-                    .set(Duration::from_millis(t.fast_path_timeout_milliseconds as u64));
+                if t.car_timeout_milliseconds != 0 || t.fast_path_timeout_milliseconds != 0 {
+                    bail!("Autobahn takes only timeout_delay; car and fast-path must be 0: {:?}", t);
+                }
+                apply_cell.set(Duration::from_millis(t.timeout_delay_milliseconds as u64));
                 Ok(())
             }
             other => bail!("expected Autobahn timeout, got {:?}", other),

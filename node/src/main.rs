@@ -13,7 +13,7 @@ use env_logger::Env;
 use adaptive::episode::{autobahn_hooks, LearningConfig, LearningManager};
 use adaptive::failure::{FaultController, ProtocolSection};
 use adaptive::metrics::LearningSample;
-use adaptive::timeouts::AutobahnTimeoutCells;
+use adaptive::timeouts::TimeoutCell;
 use network::SimpleSender;
 use primary::Header;
 use primary::Primary;
@@ -160,10 +160,11 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
-            let cells = AutobahnTimeoutCells::new(
-                Duration::from_millis(parameters.timeout_delay),
-                Duration::from_millis(parameters.fast_path_timeout),
-            );
+            // The agent sets only timeout_delay; the fast-path wait stays at
+            // its parameters.json value.
+            let timeout_delay = TimeoutCell::new(Duration::from_millis(parameters.timeout_delay));
+            let fast_path_timeout =
+                TimeoutCell::new(Duration::from_millis(parameters.fast_path_timeout));
             let faults = match (
                 matches.value_of("failure-spec"),
                 parse_u64("failure-start-unix-ms")?,
@@ -204,7 +205,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                     Duration::from_millis(parse_u64("learning-warmup-duration")?.unwrap_or(3_000));
                 cfg.reward_duration =
                     Duration::from_millis(parse_u64("learning-reward-duration")?.unwrap_or(5_000));
-                let manager = LearningManager::new(cfg, autobahn_hooks(cells.clone()))
+                let manager = LearningManager::new(cfg, autobahn_hooks(timeout_delay.clone()))
                     .context("failed to start learning manager")?;
                 Some(manager)
             } else {
@@ -212,8 +213,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             };
             analyze_learning = learning.clone();
             let instrumentation = PrimaryInstrumentation {
-                timeout_delay: cells.timeout_delay.clone(),
-                fast_path_timeout: cells.fast_path_timeout.clone(),
+                timeout_delay,
+                fast_path_timeout,
                 learning,
                 faults,
                 first_seen: Arc::clone(&first_seen),
