@@ -421,6 +421,8 @@ async fn wait_for_start(start_unix_ms: Option<u64>) {
     let Some(start_ms) = start_unix_ms else {
         return;
     };
+    // The same start line the CppBedrock, SmartBFT and Tendermint clients print.
+    client_println!("Waiting until benchmark start unix ms {}", start_ms);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")

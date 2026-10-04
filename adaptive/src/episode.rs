@@ -219,6 +219,8 @@ impl LearningManager {
             hooks.protocol,
             (hooks.timeout_ms)(&initial)
         );
+        // The harness plot reads "applied timeouts:": once here, then on every apply.
+        learning_println!("applied timeouts: timeout_delay_ms={}", (hooks.timeout_ms)(&initial));
         learning_println!(
             "wall-clock windows: feature={:?} reply_wait={:?} warmup={:?} reward={:?}",
             cfg.feature_duration,
@@ -418,6 +420,7 @@ impl LearningManager {
         if let Some(value) = decision {
             match (self.hooks.apply_timeout)(&value) {
                 Ok(()) => {
+                    learning_println!("applied timeouts: timeout_delay_ms={}", (self.hooks.timeout_ms)(&value));
                     inner.current_timeout = value;
                     applied = true;
                 }
