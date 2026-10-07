@@ -1,10 +1,6 @@
 use crate::core::MempoolMessage;
 use crate::messages::{Payload, Transaction};
-use adaptive::ack::{
-    tx_seq, tx_tag, AckIndex, ConnId, TX_TAG_RETRY_REAL, TX_TAG_RETRY_SHADOW, TX_TAG_SHADOW,
-    TX_TAG_TRACKED,
-};
-use adaptive::shadow::ShadowLog;
+use adaptive::ack::{tx_seq, AckIndex, ConnId};
 use crypto::Hash as _;
 use crypto::{PublicKey, SignatureService};
 use log::debug;
@@ -24,7 +20,6 @@ struct Runner {
     name: PublicKey,
     signature_service: SignatureService,
     ack_index: Arc<AckIndex>,
-    shadow_log: Arc<ShadowLog>,
     client_channel: Receiver<(ConnId, Transaction)>,
     core_channel: Sender<MempoolMessage>,
     request_channel: Receiver<oneshot::Sender<Payload>>,
@@ -38,7 +33,6 @@ impl Runner {
         max_size: usize,
         min_block_delay: u64,
         ack_index: Arc<AckIndex>,
-        shadow_log: Arc<ShadowLog>,
         client_channel: Receiver<(ConnId, Transaction)>,
         core_channel: Sender<MempoolMessage>,
         request_channel: Receiver<oneshot::Sender<Payload>>,
@@ -52,41 +46,13 @@ impl Runner {
             name,
             signature_service,
             ack_index,
-            shadow_log,
             client_channel,
             core_channel,
             request_channel,
         }
     }
 
-    async fn add(&mut self, conn: ConnId, mut tx: Transaction) -> Option<Payload> {
-        // Broadcast-mode per-request bookkeeping (globally unique seqs, see
-        // the client's lane striping): shadow copies stamp the arrival and
-        // are never sealed; a tracked real transaction seals unless this
-        // replica already sealed that seq. A retried real copy (the
-        // client's retransmission) seals only if the request is not already
-        // in the ordering pipeline anywhere.
-        match (tx_tag(&tx), tx_seq(&tx)) {
-            (Some(TX_TAG_SHADOW) | Some(TX_TAG_RETRY_SHADOW), Some(seq)) => {
-                self.shadow_log.record_shadow(seq, conn);
-                return None;
-            }
-            (Some(TX_TAG_TRACKED), Some(seq)) => {
-                if !self.shadow_log.record_real(seq, conn) {
-                    debug!("dropping duplicate tracked transaction {}", seq);
-                    return None;
-                }
-            }
-            (Some(TX_TAG_RETRY_REAL), Some(seq)) => {
-                if !self.shadow_log.record_retry_real(seq, conn) {
-                    debug!("dropping retried transaction {}: already in the pipeline", seq);
-                    return None;
-                }
-                // Sealed as an ordinary tracked transaction from here on.
-                tx[0] = TX_TAG_TRACKED;
-            }
-            _ => {}
-        }
+    async fn add(&mut self, conn: ConnId, tx: Transaction) -> Option<Payload> {
         let length = tx.len();
         let ret = match self.size + length > self.max_size {
             true => Some(self.make().await),
@@ -183,7 +149,6 @@ impl PayloadMaker {
         max_size: usize,
         min_block_delay: u64,
         ack_index: Arc<AckIndex>,
-        shadow_log: Arc<ShadowLog>,
         client_channel: Receiver<(ConnId, Transaction)>,
         core_channel: Sender<MempoolMessage>,
     ) -> Self {
@@ -195,7 +160,6 @@ impl PayloadMaker {
                 max_size,
                 min_block_delay,
                 ack_index,
-                shadow_log,
                 client_channel,
                 core_channel,
                 rx_request,

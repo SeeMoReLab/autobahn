@@ -25,38 +25,8 @@ pub type ConnId = u64;
 /// Minimum transaction size: tag byte + u64 sequence.
 pub const TX_HEADER_BYTES: usize = 9;
 
-/// Tag of an ordinary benchmark transaction (spread and leader client modes;
-/// per-connection seq space, arrival not tracked replica-side).
+/// Tag byte of every benchmark transaction (per-connection seq space).
 pub const TX_TAG_REAL: u8 = 1;
-
-/// Tag of a shadow copy (broadcast client mode): the 9-byte header of a real
-/// transaction, sent to every non-leader front purely so that replica can
-/// timestamp the arrival. Never sealed into a payload, never acked.
-pub const TX_TAG_SHADOW: u8 = 2;
-
-/// Tag of a tracked real transaction (broadcast client mode): sealed and
-/// acked like [`TX_TAG_REAL`], and additionally arrival-timestamped by the
-/// ingesting replica. Its seq is globally unique (lane-striped), unlike the
-/// per-connection seqs of untracked transactions, which is what makes
-/// replica-side tracking by seq sound.
-pub const TX_TAG_TRACKED: u8 = 3;
-
-/// Tag of a retried real transaction (broadcast client mode): the client
-/// re-broadcasts a transaction unacked for its retry timeout. This full copy
-/// goes to the adopted leader and is sealable unless the request is already
-/// in the ordering pipeline (it re-delivers a request the leader shed or
-/// never had).
-pub const TX_TAG_RETRY_REAL: u8 = 4;
-
-/// Tag of a retried shadow header (broadcast client mode): the
-/// retransmission as seen by every non-leader front. Never sealed; recorded
-/// like a first shadow when the request is unknown to that front.
-pub const TX_TAG_RETRY_SHADOW: u8 = 5;
-
-/// The tag byte of a transaction; None if it is too short to carry one.
-pub fn tx_tag(tx: &[u8]) -> Option<u8> {
-    tx.first().copied()
-}
 
 /// Parse the per-connection sequence number out of a transaction.
 pub fn tx_seq(tx: &[u8]) -> Option<u64> {
@@ -73,36 +43,6 @@ pub fn encode_ack_frame(seqs: &[u64]) -> Bytes {
         buf.extend_from_slice(&seq.to_be_bytes());
     }
     Bytes::from(buf)
-}
-
-/// Tag byte of a leader-hint frame. A hint frame is 17 bytes
-/// (`[0xFF][view u64 BE][replica_id u64 BE]`), distinguishable from ack
-/// frames, whose length is always a multiple of 8.
-pub const LEADER_HINT_TAG: u8 = 0xFF;
-
-/// Encode a leader hint: the sending replica's current view and the replica
-/// id (client_targets.txt order) of that view's leader. Pushed on client
-/// connections so a leader-targeting client can follow elections. Carrying
-/// the view lets the client rank hints and ignore claims from replicas that
-/// are behind.
-pub fn encode_leader_hint(view: u64, replica_id: u64) -> Bytes {
-    let mut buf = Vec::with_capacity(17);
-    buf.push(LEADER_HINT_TAG);
-    buf.extend_from_slice(&view.to_be_bytes());
-    buf.extend_from_slice(&replica_id.to_be_bytes());
-    Bytes::from(buf)
-}
-
-/// Decode a leader hint into `(view, replica_id)`; None if the frame is not
-/// hint-shaped.
-pub fn decode_leader_hint(frame: &[u8]) -> Option<(u64, u64)> {
-    if frame.len() == 17 && frame[0] == LEADER_HINT_TAG {
-        let view = u64::from_be_bytes(frame[1..9].try_into().unwrap());
-        let replica = u64::from_be_bytes(frame[9..17].try_into().unwrap());
-        Some((view, replica))
-    } else {
-        None
-    }
 }
 
 /// Decode an ack frame back into seqs. Errors on a malformed length.
@@ -195,14 +135,6 @@ impl AckRouter {
         self.conns.lock().unwrap().remove(&conn);
     }
 
-    /// Push one frame to every live client connection (leader hints).
-    pub fn broadcast(&self, frame: Bytes) {
-        let conns = self.conns.lock().unwrap();
-        for sender in conns.values() {
-            let _ = sender.send(frame.clone());
-        }
-    }
-
     /// Route acks for one committed batch, grouped per connection. Acks to
     /// closed connections are dropped silently (the client is gone).
     pub fn ack(&self, txs: &[(ConnId, u64)]) {
@@ -230,15 +162,6 @@ mod tests {
         tx.resize(64, 0);
         assert_eq!(tx_seq(&tx), Some(42));
         assert_eq!(tx_seq(&[0u8; 8]), None);
-    }
-
-    #[test]
-    fn leader_hint_roundtrip() {
-        let frame = encode_leader_hint(15, 2);
-        assert_eq!(decode_leader_hint(&frame), Some((15, 2)));
-        // Ack frames (multiples of 8 bytes) must never parse as hints.
-        assert_eq!(decode_leader_hint(&encode_ack_frame(&[1, 2])), None);
-        assert_eq!(decode_leader_hint(&frame[..9]), None);
     }
 
     #[test]

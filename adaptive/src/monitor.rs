@@ -14,8 +14,6 @@ use std::time::Duration;
 pub struct BenchmarkMetrics {
     success: AtomicI64,
     errors: AtomicI64,
-    /// Broadcast-mode retransmissions sent (see the client's retry timeout).
-    retries: AtomicI64,
     total_latency_ns: AtomicI64,
     max_latency_ms: i64,
     histogram: Mutex<HashMap<i64, i64>>,
@@ -25,7 +23,6 @@ pub struct BenchmarkMetrics {
 pub struct MetricsSnapshot {
     pub success: i64,
     pub errors: i64,
-    pub retries: i64,
     pub total_latency_ns: i64,
     pub max_latency_ms: i64,
     pub histogram: HashMap<i64, i64>,
@@ -36,7 +33,6 @@ impl BenchmarkMetrics {
         Self {
             success: AtomicI64::new(0),
             errors: AtomicI64::new(0),
-            retries: AtomicI64::new(0),
             total_latency_ns: AtomicI64::new(0),
             max_latency_ms: latency_cap_ms(request_timeout),
             histogram: Mutex::new(HashMap::new()),
@@ -55,16 +51,11 @@ impl BenchmarkMetrics {
         }
     }
 
-    pub fn record_retry(&self) {
-        self.retries.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn snapshot(&self) -> MetricsSnapshot {
         let histogram = self.histogram.lock().unwrap().clone();
         MetricsSnapshot {
             success: self.success.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            retries: self.retries.load(Ordering::Relaxed),
             total_latency_ns: self.total_latency_ns.load(Ordering::Relaxed),
             max_latency_ms: self.max_latency_ms,
             histogram,
@@ -83,7 +74,6 @@ pub fn diff_snapshot(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
     MetricsSnapshot {
         success: after.success - before.success,
         errors: after.errors - before.errors,
-        retries: after.retries - before.retries,
         total_latency_ns: after.total_latency_ns - before.total_latency_ns,
         max_latency_ms: after.max_latency_ms,
         histogram,
@@ -107,8 +97,8 @@ pub fn format_results(label: &str, duration: Duration, snap: &MetricsSnapshot) -
     let max_latency = maximum_latency(&snap.histogram, snap.success);
 
     let stats = format!(
-        "duration={:.3}s trxs={} succ={} err={} tps={:.3} avg_ms={:.3} p50={} p95={} p99={} max={} retries={}",
-        seconds, total, snap.success, snap.errors, tps, avg_ms, p50, p95, p99, max_latency, snap.retries
+        "duration={:.3}s trxs={} succ={} err={} tps={:.3} avg_ms={:.3} p50={} p95={} p99={} max={}",
+        seconds, total, snap.success, snap.errors, tps, avg_ms, p50, p95, p99, max_latency
     );
     if label == "Monitor" {
         format!("{} {} {}", timestamped_log_tag("client"), label, stats)
