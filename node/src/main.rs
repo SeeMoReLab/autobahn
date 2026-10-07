@@ -324,9 +324,9 @@ async fn analyze(
                 .unwrap_or(0);
             learning.record_consensus(LearningSample {
                 sequence: commit_index,
-                // View/regency tracking is not surfaced per committed header
-                // by this engine; view changes are recorded separately by
-                // the core, so regency_change_count stays 0.
+                // The engine surfaces no view per committed header (view
+                // changes are recorded separately by the core), and the
+                // Autobahn report carries no regency count.
                 view: 0,
                 leader_id,
                 // Batch size counts payload digests; transaction counts live

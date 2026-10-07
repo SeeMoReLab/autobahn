@@ -77,8 +77,8 @@ pub fn build_hotstuff_report(snap: &WindowSnapshot) -> pb::HotstuffReport {
     }
 }
 
-/// Autobahn report: same field mapping as HotStuff; batch sizes count
-/// payload digests per committed header.
+/// Autobahn report: same field mapping as HotStuff without the regency
+/// count; batch sizes count payload digests per committed header.
 pub fn build_autobahn_report(snap: &WindowSnapshot) -> pb::AutobahnReport {
     let p = build_base_report(snap);
     pb::AutobahnReport {
@@ -91,7 +91,6 @@ pub fn build_autobahn_report(snap: &WindowSnapshot) -> pb::AutobahnReport {
         avg_batch_size: p.avg_batch_size,
         p95_batch_size: p.p95_batch_size,
         leader_change_count: p.leader_change_count,
-        regency_change_count: p.regency_change_count,
         timeout_ms: p.timeout_ms,
         avg_inter_commit_gap_ms: p.avg_inter_commit_gap_ms,
         p50_inter_commit_gap_ms: p.p50_inter_commit_gap_ms,

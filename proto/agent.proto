@@ -158,7 +158,9 @@ message HotstuffReport {
 
 // Autobahn state report. Same layout and semantics as HotstuffReport, with
 // batch sizes measured in payload digests per committed header (transaction
-// counts live in the worker processes, not the primary).
+// counts live in the worker processes, not the primary), and no
+// regency_change_count: the engine does not surface a view per committed
+// header, so it was always 0.
 message AutobahnReport {
     uint32 total_transactions = 1;
     uint32 total_consensus_instances = 2;
@@ -169,7 +171,8 @@ message AutobahnReport {
     float avg_batch_size = 7;
     float p95_batch_size = 8;
     uint32 leader_change_count = 9;
-    uint32 regency_change_count = 10;
+    reserved 10;
+    reserved "regency_change_count";
     uint32 timeout_ms = 11;
     float avg_inter_commit_gap_ms = 12;
     float p50_inter_commit_gap_ms = 13;
@@ -313,10 +316,13 @@ message HotstuffTimeout {
     uint32 timeout_delay_milliseconds = 1;
 }
 
+// Autobahn's only action is the view-change timeout; the fast-path wait is a
+// fixed parameter (config/autobahn/parameters.json) and the engine has no car
+// timeout.
 message AutobahnTimeout {
     uint32 timeout_delay_milliseconds = 1;
-    uint32 car_timeout_milliseconds = 2;
-    uint32 fast_path_timeout_milliseconds = 3;
+    reserved 2, 3;
+    reserved "car_timeout_milliseconds", "fast_path_timeout_milliseconds";
 }
 
 message SmartbftTimeout {

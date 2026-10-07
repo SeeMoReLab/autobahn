@@ -118,15 +118,11 @@ pub fn hotstuff_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
 }
 
 /// Ready-made hooks for Autobahn: a single knob, the per-slot view-change
-/// timeout_delay, written to `cell`. The proto's car_timeout and
-/// fast_path_timeout fields are sent as 0 and must be 0 on receipt: the
-/// engine has no timer that reads car_timeout, and fast_path_timeout is a
-/// fixed parameter (parameters.json), not an action.
+/// timeout_delay, written to `cell`. The fast-path wait is a fixed parameter
+/// (parameters.json), not an action.
 pub fn autobahn_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
     let initial = pb::AutobahnTimeout {
         timeout_delay_milliseconds: cell.get().as_millis().min(u32::MAX as u128) as u32,
-        car_timeout_milliseconds: 0,
-        fast_path_timeout_milliseconds: 0,
     };
     let apply_cell = cell.clone();
     ProtocolHooks {
@@ -150,9 +146,6 @@ pub fn autobahn_hooks(cell: crate::timeouts::TimeoutCell) -> ProtocolHooks {
             pb::timeout::Value::Autobahn(t) => {
                 if t.timeout_delay_milliseconds == 0 {
                     bail!("non-positive timeout delay");
-                }
-                if t.car_timeout_milliseconds != 0 || t.fast_path_timeout_milliseconds != 0 {
-                    bail!("Autobahn takes only timeout_delay; car and fast-path must be 0: {:?}", t);
                 }
                 apply_cell.set(Duration::from_millis(t.timeout_delay_milliseconds as u64));
                 Ok(())
