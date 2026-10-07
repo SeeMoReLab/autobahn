@@ -73,9 +73,6 @@ pub struct Core {
     // Receive sync requests for headers required at the consensus layer
     rx_request_header_sync: Receiver<Digest>,
 
-    /// The last garbage collected round.
-    gc_round: Height,
-
     /// The authors of the last voted headers. (Ensures only voting for one header per round)
     last_voted: HashMap<Height, HashSet<PublicKey>>,
     /// The last header we proposed (for which we are waiting votes).
@@ -111,7 +108,6 @@ pub struct Core {
     already_proposed_slots: HashSet<Slot>,
     tx_info: Sender<ConsensusMessage>,
     leader_elector: LeaderElector,
-    timeout_delay: u64,
     // GC the vote aggregators and current headers
     // gc_map: HashMap<Round, Digest>,
   
@@ -192,7 +188,6 @@ impl Core {
         rx_request_header_sync: Receiver<Digest>,
         tx_info: Sender<ConsensusMessage>,
         leader_elector: LeaderElector,
-        timeout_delay: u64,
         use_optimistic_tips: bool,
         use_parallel_proposals: bool,
         k: u64,
@@ -224,7 +219,6 @@ impl Core {
                 rx_request_header_sync,
                 tx_info,
                 leader_elector,
-                gc_round: 0,
                 current_qcs_formed: 0,
                 sent_cert_to_proposer: false,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
@@ -247,7 +241,6 @@ impl Core {
                 // cqc_makers: HashMap::with_capacity(2 * gc_depth as usize),
                 tc_makers: HashMap::with_capacity(2 * gc_depth as usize),
                 prepare_tickets: VecDeque::with_capacity(2 * gc_depth as usize),
-                timeout_delay,
                 timer_futures: FuturesUnordered::new(),
                 //gc_map: HashMap::with_capacity(2 * gc_depth as usize),
                 
@@ -282,10 +275,6 @@ impl Core {
 
     fn current_timeout_delay(&self) -> u64 {
         self.instrumentation.timeout_delay.get().as_millis() as u64
-    }
-
-    fn current_fast_path_timeout(&self) -> u64 {
-        self.instrumentation.fast_path_timeout.get().as_millis() as u64
     }
 
     /// The injected hold for a leader's Prepare, if the active fault phase
@@ -804,7 +793,7 @@ impl Core {
                         consensus_votes: vec![(*slot, digest.clone(), Signature::default())], 
                         //consensus_instance: Some(current_instance.clone()), //Buffer instance. Current header could've advanced in the meantime and thus no longer include this instance by the time timer triggers
                     };
-                    let fast_timer = CarTimer::new(t_vote, self.current_fast_path_timeout());
+                    let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
                     self.car_timer_futures.push(Box::pin(fast_timer));
                     //self.timers.insert((tc.slot, tc.view + 1));
                 }
@@ -905,7 +894,7 @@ impl Core {
                 consensus_votes: vec![], //Create dummy vote with no sigs => this indicates its the Car timeout
                 //consensus_instance: None
             };
-            let fast_timer = CarTimer::new(t_vote, self.current_fast_path_timeout());
+            let fast_timer = CarTimer::new(t_vote, self.fast_path_timeout);
             self.car_timer_futures.push(Box::pin(fast_timer));
         }
 
@@ -982,7 +971,7 @@ impl Core {
                     //By including only the digest of the missing instance we avoid duplicates. 
                         //Alternatively could modify QCMaker such that it wipes the QC after first use
 
-                let fast_timer = FastTimer::new(vote.clone(), self.current_fast_path_timeout());
+                let fast_timer = FastTimer::new(vote.clone(), self.fast_path_timeout);
                 self.fast_timer_futures.push(Box::pin(fast_timer));
                 //self.timers.insert((tc.slot, tc.view + 1));
             }
@@ -2468,8 +2457,6 @@ impl Core {
                 let own_floor = self.lane_gc_floor(&self.name);
                 self.cancel_handlers.retain(|k, _| k >= &own_floor);
                 self.trusted_tips.retain(|_, height| *height >= gc_round);
-                self.gc_round = gc_round;
-                debug!("GC round moved to {}", self.gc_round);
             }
         }
     }

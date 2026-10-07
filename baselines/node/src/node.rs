@@ -338,7 +338,6 @@ impl Node {
                     batch_size: tx_count,
                     decision_time: delivered.committed_at,
                     latencies,
-                    timeout: Duration::ZERO,
                 });
             }
         }

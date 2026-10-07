@@ -88,9 +88,9 @@ pub struct HeaderWaiter {
     /// abandoning the sync, the second spaces the retries. Using one field for
     /// both means a retried request either never expires or is retried on
     /// every timer tick.
-    parent_requests: HashMap<Digest, (Height, u128, u128)>,
+    parent_requests: HashMap<Digest, (u128, u128)>,
     //same, but for special parents
-    header_requests: HashMap<Digest, (Height, u128)>,
+    header_requests: HashMap<Digest, u128>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
     batch_requests: HashMap<Digest, u128>,
@@ -142,8 +142,6 @@ impl HeaderWaiter {
         });
     }
 
-    /// Helper function. It waits for particular data to become available in the storage
-    /// and then delivers the specified header.
     /// Ask our own worker to fetch these batches from the author's worker.
     /// `batch_requests` dedupes per digest, so asking twice for the same batch
     /// costs nothing.
@@ -197,6 +195,8 @@ impl HeaderWaiter {
         }
     }
 
+    /// Helper function. It waits for particular data to become available in the storage
+    /// and then delivers the specified header.
     async fn waiter(
         mut missing: Vec<(Vec<u8>, Store)>,
         deliver: Header,
@@ -248,7 +248,6 @@ impl HeaderWaiter {
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();
                             let header_id_for_wait = header.id.clone();
-                            let round = header.height;
                             let author = header.author;
 
                             // Ensure we sync only once per header.
@@ -292,7 +291,7 @@ impl HeaderWaiter {
                             let mut requires_sync = Vec::new();
                             self.header_requests.entry(missing.clone()).or_insert_with(|| {
                                 requires_sync.push(missing);
-                                (0, now)
+                                now
                             });
 
                             if !requires_sync.is_empty() {
@@ -311,7 +310,6 @@ impl HeaderWaiter {
                         WaiterMessage::SyncParent(missing, header) => {
                             debug!("Synching the parents of {}", header);
                             let header_id = header.id.clone();
-                            let height = header.height();
                             let author = header.author;
 
                             // Ensure we sync only once per header.
@@ -338,7 +336,7 @@ impl HeaderWaiter {
                             let mut requires_sync = Vec::new();
                             self.parent_requests.entry(missing.clone()).or_insert_with(|| {
                                 requires_sync.push(missing);
-                                (height, now, now)
+                                (now, now)
                             });
                             if !requires_sync.is_empty() {
                                 let address = self.committee
@@ -354,7 +352,6 @@ impl HeaderWaiter {
 
                         WaiterMessage::SyncProposals(missing, consensus_message, header) => {
                             //let header_id = header.id.clone();
-                            let height = header.height();
                             let author = header.author;
                             let id = proposal_digest(&consensus_message);
                             //println!("syncing proposals in header waiter");
@@ -388,7 +385,7 @@ impl HeaderWaiter {
                             for missing in missing {
                                 self.parent_requests.entry(missing.header_digest.clone()).or_insert_with(|| {
                                     requires_sync.push(missing.header_digest);
-                                    (missing.height, now, now)
+                                    (now, now)
                                 });
                             }
                             if !requires_sync.is_empty() {
@@ -479,7 +476,7 @@ impl HeaderWaiter {
 
                     //Retry CertificateRequests
                     let mut retry = Vec::new();
-                    for (digest, (_, _, last_retry)) in &self.parent_requests {
+                    for (digest, (_, last_retry)) in &self.parent_requests {
                         if last_retry + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting retry sync for parent header {} (retry)", digest);
                             retry.push(digest.clone());
@@ -492,7 +489,7 @@ impl HeaderWaiter {
                     // Only `last_retry` moves: the creation time below still
                     // decides when the sync is abandoned.
                     for digest in &retry {
-                        if let Some((_, _, last_retry)) = self.parent_requests.get_mut(digest) {
+                        if let Some((_, last_retry)) = self.parent_requests.get_mut(digest) {
                             *last_retry = now;
                         }
                     }
@@ -519,8 +516,8 @@ impl HeaderWaiter {
             self.pending.retain(|_, (since, _)| *since + expiry >= now);
             self.payload_waits.retain(|_, (since, _, _)| *since + expiry >= now);
             self.batch_requests.retain(|_, since| *since + expiry >= now);
-            self.parent_requests.retain(|_, (_, since, _)| *since + expiry >= now);
-            self.header_requests.retain(|_, (_, since)| *since + expiry >= now);
+            self.parent_requests.retain(|_, (since, _)| *since + expiry >= now);
+            self.header_requests.retain(|_, since| *since + expiry >= now);
         }
     }
 }

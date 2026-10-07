@@ -77,13 +77,12 @@ pub enum WorkerPrimaryMessage {
 
 pub struct Primary;
 
-/// Adaptive-timer instrumentation for the primary: runtime timeout knobs,
-/// learning-event recording, protocol failure injection, and the first-seen
+/// Adaptive-timer instrumentation for the primary: the runtime view-change
+/// timeout, learning-event recording, protocol failure injection, and the first-seen
 /// registry used to compute header commit latency in the application layer.
 /// Replica ids are the harness's global 0-based ids (see the failure spec).
 pub struct PrimaryInstrumentation {
     pub timeout_delay: adaptive::timeouts::TimeoutCell,
-    pub fast_path_timeout: adaptive::timeouts::TimeoutCell,
     pub learning: Option<std::sync::Arc<adaptive::episode::LearningManager>>,
     /// Protocol fault injection (proposal and vote delays keyed by this
     /// replica's global id).
@@ -91,20 +90,17 @@ pub struct PrimaryInstrumentation {
     pub first_seen:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Digest, std::time::Instant>>>,
     pub replica_id: u32,
-    pub replica_of: std::collections::HashMap<PublicKey, u32>,
 }
 
+#[cfg(test)]
 impl PrimaryInstrumentation {
-    /// No learning, no failure injection; timeout cells fixed at the
-    /// parameters' values.
+    /// For tests: no learning, no failure injection, and the timeout fixed
+    /// at the parameters' value.
     pub fn disabled(parameters: &Parameters) -> Self {
         use std::time::Duration;
         Self {
             timeout_delay: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
                 parameters.timeout_delay,
-            )),
-            fast_path_timeout: adaptive::timeouts::TimeoutCell::new(Duration::from_millis(
-                parameters.fast_path_timeout,
             )),
             learning: None,
             faults: std::sync::Arc::new(adaptive::failure::FaultController::disabled()),
@@ -112,7 +108,6 @@ impl PrimaryInstrumentation {
                 std::collections::HashMap::new(),
             )),
             replica_id: 0,
-            replica_of: std::collections::HashMap::new(),
         }
     }
 }
@@ -244,7 +239,6 @@ impl Primary {
             rx_request_header_sync,
             /*tx info */ tx_instance,
             LeaderElector::new(committee.clone()),
-            parameters.timeout_delay,
             parameters.use_optimistic_tips,
             parameters.use_parallel_proposals,
             parameters.k,

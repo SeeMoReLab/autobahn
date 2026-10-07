@@ -22,8 +22,6 @@ pub struct LearningSample {
     /// Latencies attributed to this decision: its consensus latency (first
     /// sighting to delivery), or none when that is unknown.
     pub latencies: Vec<Duration>,
-    /// The timeout in force when the decision committed (0 = unchanged).
-    pub timeout: Duration,
 }
 
 #[derive(Default)]
@@ -86,14 +84,6 @@ impl LearningWindowMetrics {
         self.throughput_start_time = Some(start);
     }
 
-    pub fn total_consensus(&self) -> u64 {
-        self.total_consensus
-    }
-
-    pub fn total_transactions(&self) -> u64 {
-        self.total_transactions
-    }
-
     pub fn record(&mut self, sample: &LearningSample) {
         self.total_consensus += 1;
         self.total_transactions += sample.batch_size as u64;
@@ -123,9 +113,6 @@ impl LearningWindowMetrics {
         self.previous_decision_time = Some(sample.decision_time);
         self.last_decision_time = Some(sample.decision_time);
 
-        if sample.timeout > Duration::ZERO {
-            self.timeout = sample.timeout;
-        }
         self.latencies.extend(sample.latencies.iter().copied());
     }
 
@@ -221,6 +208,7 @@ mod tests {
         let mut m = LearningWindowMetrics::new();
         let t0 = Instant::now();
         m.reset_with_throughput_start(t0);
+        m.timeout = Duration::from_millis(800);
         for i in 0..3u64 {
             m.record(&LearningSample {
                 sequence: i,
@@ -229,7 +217,6 @@ mod tests {
                 batch_size: 10,
                 decision_time: t0 + Duration::from_millis(100 * (i + 1)),
                 latencies: vec![Duration::from_millis(50)],
-                timeout: Duration::from_millis(800),
             });
         }
         let snap = m.snapshot_until(Some(t0 + Duration::from_secs(1)));

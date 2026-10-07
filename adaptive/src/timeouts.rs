@@ -27,11 +27,5 @@ impl TimeoutCell {
         // send_replace never fails and updates even without receivers.
         self.tx.send_replace(value);
     }
-
-    /// Subscribe for change notifications (e.g. to re-arm a pending timer
-    /// immediately instead of on its next natural re-arm).
-    pub fn subscribe(&self) -> watch::Receiver<Duration> {
-        self.tx.subscribe()
-    }
 }
 

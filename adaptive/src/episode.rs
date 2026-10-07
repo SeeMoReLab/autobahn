@@ -252,12 +252,6 @@ impl LearningManager {
         }))
     }
 
-    /// The timeout value currently in force (primary knob, ms).
-    pub fn current_timeout_ms(&self) -> u32 {
-        let inner = self.inner.lock().unwrap();
-        (self.hooks.timeout_ms)(&inner.current_timeout)
-    }
-
     /// Record one delivered consensus instance. Starts the wall-clock episode
     /// loop on the first sample.
     pub fn record_consensus(self: &Arc<Self>, sample: LearningSample) {

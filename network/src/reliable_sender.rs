@@ -24,15 +24,15 @@ pub mod reliable_sender_tests;
 /// Convenient alias for cancel handlers returned to the caller task.
 pub type CancelHandler = oneshot::Receiver<Bytes>;
 
-/// We keep alive one TCP connection per peer, each connection is handled by a separate task (called `Connection`).
-/// We communicate with our 'connections' through a dedicated channel kept by the HashMap called `connections`.
-/// This sender is 'reliable' in the sense that it keeps trying to re-transmit messages for which it didn't
-/// receive an ACK back (until they succeed or are canceled).
 /// Cap on the exponential reconnect backoff. A peer that was down for minutes
 /// used to take up to 60s to be noticed again; a returning replica should be
 /// back in every peer's view within a few seconds.
 const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
+/// We keep alive one TCP connection per peer, each connection is handled by a separate task (called `Connection`).
+/// We communicate with our 'connections' through a dedicated channel kept by the HashMap called `connections`.
+/// This sender is 'reliable' in the sense that it keeps trying to re-transmit messages for which it didn't
+/// receive an ACK back (until they succeed or are canceled).
 pub struct ReliableSender {
     /// A map holding the channels to our connections.
     connections: HashMap<SocketAddr, Sender<InnerMessage>>,

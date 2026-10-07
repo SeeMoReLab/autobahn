@@ -160,11 +160,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
-            // The agent sets only timeout_delay; the fast-path wait stays at
-            // its parameters.json value.
+            // The agent sets only timeout_delay; the fast-path wait is the
+            // fixed parameters.json value.
             let timeout_delay = TimeoutCell::new(Duration::from_millis(parameters.timeout_delay));
-            let fast_path_timeout =
-                TimeoutCell::new(Duration::from_millis(parameters.fast_path_timeout));
             let faults = match (
                 matches.value_of("failure-spec"),
                 parse_u64("failure-start-unix-ms")?,
@@ -214,12 +212,10 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             analyze_learning = learning.clone();
             let instrumentation = PrimaryInstrumentation {
                 timeout_delay,
-                fast_path_timeout,
                 learning,
                 faults,
                 first_seen: Arc::clone(&first_seen),
                 replica_id,
-                replica_of: replica_of.clone(),
             };
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
@@ -338,7 +334,6 @@ async fn analyze(
                 batch_size: header.payload.len(),
                 decision_time: committed_at,
                 latencies,
-                timeout: Duration::ZERO,
             });
         }
 
