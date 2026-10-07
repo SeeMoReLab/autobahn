@@ -7,7 +7,6 @@ use crate::primary::Height;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService, Hash};
 use log::debug;
-#[cfg(feature = "benchmark")]
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
