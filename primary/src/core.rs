@@ -288,36 +288,18 @@ impl Core {
         self.instrumentation.fast_path_timeout.get().as_millis() as u64
     }
 
-    // Resolve the current consensus leader to a global replica id and keep
-    // the proposal-delay controller's leader window pinned.
-    /// The injected hold for a leader-originated consensus message, if the
-    /// active fault phase targets this replica and selects this message kind.
+    /// The injected hold for a leader's Prepare, if the active fault phase
+    /// targets this replica. Confirm and Commit are never held.
     fn injected_consensus_delay(&self, message: &ConsensusMessage) -> Option<Duration> {
-        let fault = self
-            .instrumentation
-            .faults
-            .proposal_fault(self.instrumentation.replica_id)?;
-        let selected = match message {
-            ConsensusMessage::Prepare { .. } => fault.messages.prepare,
-            ConsensusMessage::Confirm { .. } => fault.messages.confirm,
-            ConsensusMessage::Commit { .. } => fault.messages.commit,
-        };
-        if !selected {
+        if !matches!(message, ConsensusMessage::Prepare { .. }) {
             return None;
         }
-        let delay = fault
-            .delay
+        let delay = self
+            .instrumentation
+            .faults
+            .proposal_delay(self.instrumentation.replica_id)?
             .resolve(Duration::from_millis(self.current_timeout_delay()));
         (delay > Duration::ZERO).then_some(delay)
-    }
-
-    /// Whether the active fault phase makes this replica, as a leader, ignore
-    /// unanimous Prepare QCs and take the slow path after its fast-path wait.
-    fn injected_force_slow_path(&self) -> bool {
-        self.instrumentation
-            .faults
-            .proposal_fault(self.instrumentation.replica_id)
-            .map_or(false, |fault| fault.force_slow_path)
     }
 
     /// The injected hold for this replica's consensus votes, if targeted.
@@ -760,7 +742,6 @@ impl Core {
             //     false => self.current_header.consensus_messages.get(digest).unwrap(),
             // };
             
-            let force_slow = self.injected_force_slow_path();
             let qc_maker = self.qc_makers.entry((*slot, digest.clone())).or_insert(QCMaker::new());
             // let qc_maker = match current_instance {
             //     ConsensusMessage::Prepare {slot, view, tc: _, proposals: _, } => self.qc_makers.entry((*slot, digest.clone())).or_insert(QCMaker::new()), //self.pqc_makers.entry((*slot, *view)).or_insert(QCMaker::new()), 
@@ -786,7 +767,6 @@ impl Core {
                 ConsensusMessage::Prepare {slot: _, view: _, tc: _, qc_ticket: _, proposals: _, } => self.use_fast_path,  //Only PrepareQC should try to compute a FastQC
                 _ => false,
             };
-            qc_maker.force_slow = force_slow;
 
             //println!("qc maker weight {:?}", qc_maker.votes.len());
 
@@ -969,7 +949,6 @@ impl Core {
         //Invariant: All votes contain the same content (i.e. it's not the case that some of them carry things like timeouts etc)
         //Wait to form num_active instance many QCs
         
-        let force_slow = self.injected_force_slow_path();
         let qc_maker = self.qc_makers.entry((vote.slot, vote.digest.clone())).or_insert(QCMaker::new());
     
         //Configure qc_maker to try to use Fast Path
@@ -977,7 +956,6 @@ impl Core {
             ConsensusMessage::Prepare {slot: _, view: _, tc: _, qc_ticket: _, proposals: _, } => self.use_fast_path,  //Only PrepareQC should try to compute a FastQC
             _ => false,
         };
-        qc_maker.force_slow = force_slow;
  
         
  

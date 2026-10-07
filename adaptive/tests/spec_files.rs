@@ -21,17 +21,8 @@ fn checked_in_specs_load_under_both_sections() {
         eprintln!("parent config directory not found; skipping");
         return;
     };
-    let specs = [
-        "autobahn/failure_spec.xml",
-        "autobahn/failure_spec_timeout_demo.xml",
-        "hotstuff/failure_spec.xml",
-    ];
-    for rel in specs {
+    for rel in ["autobahn/failure_spec.xml", "hotstuff/failure_spec.xml"] {
         let path = config.join(rel);
-        if !path.is_file() {
-            eprintln!("{} not found; skipping", path.display());
-            continue;
-        }
         let path = path.to_str().unwrap();
         for section in [ProtocolSection::Autobahn, ProtocolSection::Hotstuff] {
             FaultController::load_file(path, 0, section)

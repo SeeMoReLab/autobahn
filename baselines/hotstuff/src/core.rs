@@ -404,8 +404,8 @@ impl Core {
         // payload_inflight stays set meanwhile so the round is not proposed
         // twice.
         if !resumed {
-            if let Some(fault) = self.instrumentation.faults.proposal_fault(self.instrumentation.replica_id) {
-                let delay = fault.delay.resolve(self.instrumentation.timeout_cell.get());
+            if let Some(fault) = self.instrumentation.faults.proposal_delay(self.instrumentation.replica_id) {
+                let delay = fault.resolve(self.instrumentation.timeout_cell.get());
                 if delay > Duration::ZERO {
                     warn!(
                         "Injecting proposal delay of {} ms in round {}",

@@ -14,13 +14,8 @@
 //! Two fault kinds, per protocol section:
 //!
 //! - `<proposalDelay>`: the replica delays the consensus proposals it leads.
-//!   In HotStuff that is the block proposal. In Autobahn `<messages>` selects
-//!   which leader-originated phases are held (`prepare` by default, so the
-//!   fault means the same thing as in HotStuff; `confirm` and `commit` are
-//!   available for a leader that is slow in every phase), and
-//!   `<forceSlowPath>` makes the leader ignore a unanimous Prepare QC and
-//!   take the slow path after its own fast-path wait, which to followers is
-//!   indistinguishable from an honest leader stuck behind a silent voter.
+//!   In HotStuff that is the block proposal; in Autobahn it is the Prepare,
+//!   so the fault means the same thing in both.
 //! - `<voteDelay>` (Autobahn only): the replica delays its consensus votes
 //!   and nothing else. This is the fault that isolates `fast_path_timeout`:
 //!   the late vote defeats unanimity without making the replica's own
@@ -31,9 +26,12 @@
 //! at zero). The relative form is the worst-case legal leader: it stretches
 //! every turn to just under the timeout and is never deposed.
 //!
-//! Phases sort by start then document order; `warmUpTime`/`warmUpTimeMs`
-//! shifts all of them. The old `<interval>`/`<count>` repetition existed only
-//! to re-resolve the `leader` token per tick and is rejected too.
+//! Every phase starts at `<atTime>` (seconds) or `<atTimeMs>`, exactly one of
+//! them; phases sort by start then document order, and
+//! `warmUpTime`/`warmUpTimeMs` shifts all of them. Inside a protocol section
+//! an unknown element is a load error, so a removed form (the old
+//! `<interval>`/`<count>` repetition, `<messages>`, `<forceSlowPath>`, the
+//! bare `<id>` list) fails loudly instead of being ignored.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -83,59 +81,6 @@ impl FaultDelay {
     }
 }
 
-/// Which leader-originated Autobahn consensus messages a proposal delay
-/// holds. HotStuff has a single proposal per turn and ignores this.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProposalMessages {
-    pub prepare: bool,
-    pub confirm: bool,
-    pub commit: bool,
-}
-
-impl Default for ProposalMessages {
-    fn default() -> Self {
-        Self {
-            prepare: true,
-            confirm: false,
-            commit: false,
-        }
-    }
-}
-
-impl ProposalMessages {
-    fn parse(text: &str) -> Result<Self> {
-        let mut set = Self {
-            prepare: false,
-            confirm: false,
-            commit: false,
-        };
-        for raw in text.split(',') {
-            match raw.trim().to_ascii_lowercase().as_str() {
-                "" => continue,
-                "prepare" => set.prepare = true,
-                "confirm" => set.confirm = true,
-                "commit" => set.commit = true,
-                other => bail!(
-                    "invalid <messages> entry {:?} in proposalDelay (expected prepare, confirm, commit)",
-                    other
-                ),
-            }
-        }
-        if !(set.prepare || set.confirm || set.commit) {
-            bail!("<messages> in proposalDelay selects no message");
-        }
-        Ok(set)
-    }
-}
-
-/// The proposal-side fault active for one replica.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProposalFault {
-    pub delay: FaultDelay,
-    pub messages: ProposalMessages,
-    pub force_slow_path: bool,
-}
-
 #[derive(Debug, Deserialize)]
 struct FailureSpecXml {
     #[serde(rename = "warmUpTime")]
@@ -153,20 +98,16 @@ struct PhasesXml {
 
 #[derive(Debug, Deserialize)]
 struct PhaseXml {
-    #[serde(rename = "startAt")]
-    start_at: Option<f64>,
-    #[serde(rename = "startAtMs")]
-    start_at_ms: Option<i64>,
     #[serde(rename = "atTime")]
     at_time: Option<f64>,
     #[serde(rename = "atTimeMs")]
     at_time_ms: Option<i64>,
-    time: Option<f64>,
     hotstuff: Option<ProtocolSectionXml>,
     autobahn: Option<ProtocolSectionXml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProtocolSectionXml {
     #[serde(rename = "proposalDelay")]
     proposal_delay: Option<ProposalDelayXml>,
@@ -175,22 +116,17 @@ struct ProtocolSectionXml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProposalDelayXml {
     #[serde(rename = "delayMs")]
     delay_ms: Option<i64>,
     #[serde(rename = "delayRelativeToTimeoutMs")]
     delay_relative_to_timeout_ms: Option<i64>,
-    messages: Option<String>,
-    #[serde(rename = "forceSlowPath")]
-    force_slow_path: Option<bool>,
-    interval: Option<f64>,
-    #[serde(rename = "intervalMs")]
-    interval_ms: Option<i64>,
-    count: Option<i64>,
     replicas: Option<ReplicasXml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VoteDelayXml {
     #[serde(rename = "delayMs")]
     delay_ms: Option<i64>,
@@ -200,14 +136,14 @@ struct VoteDelayXml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplicasXml {
     #[serde(rename = "replica", default)]
     replicas: Vec<ReplicaXml>,
-    #[serde(rename = "id", default)]
-    ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplicaXml {
     id: String,
     #[serde(rename = "delayMs")]
@@ -218,7 +154,7 @@ struct ReplicaXml {
 
 #[derive(Clone, Debug, Default)]
 struct FaultRule {
-    proposal: HashMap<u32, ProposalFault>,
+    proposal: HashMap<u32, FaultDelay>,
     vote: HashMap<u32, FaultDelay>,
 }
 
@@ -268,7 +204,7 @@ impl FaultController {
             .into_iter()
             .enumerate()
         {
-            let start = phase_start(&phase);
+            let start = phase_start(&phase).with_context(|| format!("phase #{}", order))?;
             let section_xml = match section {
                 ProtocolSection::Hotstuff => phase.hotstuff,
                 ProtocolSection::Autobahn => phase.autobahn,
@@ -351,9 +287,9 @@ impl FaultController {
         }
     }
 
-    /// The proposal-delay fault this replica must apply right now, if the
-    /// active phase targets it.
-    pub fn proposal_fault(&self, replica_id: u32) -> Option<ProposalFault> {
+    /// The proposal delay this replica must apply right now, if the active
+    /// phase targets it.
+    pub fn proposal_delay(&self, replica_id: u32) -> Option<FaultDelay> {
         self.active_phase()
             .and_then(|phase| phase.rule.proposal.get(&replica_id).copied())
     }
@@ -372,63 +308,22 @@ fn sorted_keys<V>(map: &HashMap<u32, V>) -> Vec<u32> {
     keys
 }
 
-fn phase_start(phase: &PhaseXml) -> Duration {
-    if let Some(ms) = phase.start_at_ms {
-        return non_negative_ms(ms);
+fn phase_start(phase: &PhaseXml) -> Result<Duration> {
+    match (phase.at_time, phase.at_time_ms) {
+        (Some(s), None) => Ok(non_negative_secs(s)),
+        (None, Some(ms)) => Ok(non_negative_ms(ms)),
+        (Some(_), Some(_)) => bail!("gives both <atTime> and <atTimeMs>; use exactly one"),
+        (None, None) => bail!("has no <atTime> or <atTimeMs>"),
     }
-    if let Some(ms) = phase.at_time_ms {
-        return non_negative_ms(ms);
-    }
-    if let Some(s) = phase.start_at {
-        return non_negative_secs(s);
-    }
-    if let Some(s) = phase.at_time {
-        return non_negative_secs(s);
-    }
-    if let Some(s) = phase.time {
-        return non_negative_secs(s);
-    }
-    Duration::ZERO
 }
 
 fn parse_rule(section: &ProtocolSectionXml, protocol: ProtocolSection) -> Result<FaultRule> {
     let mut rule = FaultRule::default();
 
     if let Some(pd) = &section.proposal_delay {
-        if pd.interval.is_some() || pd.interval_ms.is_some() || pd.count.is_some() {
-            bail!(
-                "<interval>/<intervalMs>/<count> are no longer supported in proposalDelay; \
-                 faults target fixed replica ids and need no per-tick re-resolution"
-            );
-        }
-        let mut messages = ProposalMessages::default();
-        let mut force_slow_path = false;
-        match protocol {
-            ProtocolSection::Autobahn => {
-                if let Some(text) = &pd.messages {
-                    messages = ProposalMessages::parse(text)?;
-                }
-                force_slow_path = pd.force_slow_path.unwrap_or(false);
-            }
-            ProtocolSection::Hotstuff => {
-                if pd.messages.is_some() {
-                    bail!("<messages> in proposalDelay is Autobahn-only; HotStuff has one proposal per round");
-                }
-                if pd.force_slow_path.is_some() {
-                    bail!("<forceSlowPath> in proposalDelay is Autobahn-only; HotStuff has no fast path");
-                }
-            }
-        }
         let default_delay = parse_delay(pd.delay_ms, pd.delay_relative_to_timeout_ms, "proposalDelay")?;
         for (id, delay) in parse_targets(pd.replicas.as_ref(), default_delay, "proposalDelay")? {
-            rule.proposal.insert(
-                id,
-                ProposalFault {
-                    delay,
-                    messages,
-                    force_slow_path,
-                },
-            );
+            rule.proposal.insert(id, delay);
         }
     }
 
@@ -459,10 +354,9 @@ fn parse_delay(fixed_ms: Option<i64>, relative_ms: Option<i64>, what: &str) -> R
     }
 }
 
-/// Resolve the `<replicas>` block of a fault into (replica id, delay) pairs.
-/// Supports both `<replica><id/><delayMs/></replica>` entries (per-replica
-/// delay, falling back to the rule default) and the bare `<id>` list (rule
-/// default required).
+/// Resolve the `<replicas>` block of a fault into (replica id, delay) pairs:
+/// `<replica><id/><delayMs/></replica>` entries, each delay falling back to
+/// the rule default.
 fn parse_targets(
     replicas: Option<&ReplicasXml>,
     default_delay: Option<FaultDelay>,
@@ -487,21 +381,6 @@ fn parse_targets(
                     what, id
                 )
             })?;
-        out.push((id, delay));
-    }
-
-    for raw_id in &replicas.ids {
-        let id_text = raw_id.trim();
-        if id_text.is_empty() {
-            continue;
-        }
-        let id = parse_replica_id(id_text, what)?;
-        let delay = default_delay.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} lists replica {} by bare <id> but sets no rule-level delay",
-                what, id
-            )
-        })?;
         out.push((id, delay));
     }
 
@@ -559,8 +438,6 @@ mod tests {
             <atTime>60</atTime>
             <autobahn>
                 <proposalDelay>
-                    <messages>prepare,confirm</messages>
-                    <forceSlowPath>true</forceSlowPath>
                     <replicas>
                         <replica><id>3</id><delayMs>3000</delayMs></replica>
                     </replicas>
@@ -575,7 +452,7 @@ mod tests {
                 <proposalDelay>
                     <delayMs>2500</delayMs>
                     <replicas>
-                        <id>3</id>
+                        <replica><id>3</id></replica>
                     </replicas>
                 </proposalDelay>
             </hotstuff>
@@ -615,15 +492,7 @@ mod tests {
         let phase1 = &ctrl.phases[1].rule;
         assert_eq!(
             phase1.proposal.get(&3),
-            Some(&ProposalFault {
-                delay: FaultDelay::Fixed(Duration::from_millis(3000)),
-                messages: ProposalMessages {
-                    prepare: true,
-                    confirm: true,
-                    commit: false
-                },
-                force_slow_path: true,
-            })
+            Some(&FaultDelay::Fixed(Duration::from_millis(3000)))
         );
         assert_eq!(
             phase1.vote.get(&1),
@@ -633,17 +502,13 @@ mod tests {
     }
 
     #[test]
-    fn hotstuff_section_reads_bare_id_list_with_rule_default() {
+    fn hotstuff_section_falls_back_to_rule_delay() {
         let ctrl = controller_at(Duration::from_secs(100), ProtocolSection::Hotstuff);
         assert_eq!(
-            ctrl.proposal_fault(3),
-            Some(ProposalFault {
-                delay: FaultDelay::Fixed(Duration::from_millis(2500)),
-                messages: ProposalMessages::default(),
-                force_slow_path: false,
-            })
+            ctrl.proposal_delay(3),
+            Some(FaultDelay::Fixed(Duration::from_millis(2500)))
         );
-        assert!(ctrl.proposal_fault(1).is_none());
+        assert!(ctrl.proposal_delay(1).is_none());
         // The autobahn-only vote fault never leaks into the hotstuff view.
         assert!(ctrl.vote_delay(1).is_none());
     }
@@ -651,7 +516,7 @@ mod tests {
     #[test]
     fn warmup_disables_injection() {
         let ctrl = FaultController::load(SPEC, now_unix_ms(), ProtocolSection::Autobahn).unwrap();
-        assert!(ctrl.proposal_fault(3).is_none());
+        assert!(ctrl.proposal_delay(3).is_none());
         assert!(ctrl.vote_delay(1).is_none());
     }
 
@@ -659,18 +524,18 @@ mod tests {
     fn faults_follow_the_active_phase() {
         // 30 s past warm-up: phase 0, no targets.
         let ctrl = controller_at(Duration::from_secs(30), ProtocolSection::Autobahn);
-        assert!(ctrl.proposal_fault(3).is_none());
+        assert!(ctrl.proposal_delay(3).is_none());
         // 100 s: phase 1 targets 3 (proposal) and 1 (vote).
         let ctrl = controller_at(Duration::from_secs(100), ProtocolSection::Autobahn);
-        assert!(ctrl.proposal_fault(3).is_some());
-        assert!(ctrl.proposal_fault(2).is_none());
+        assert!(ctrl.proposal_delay(3).is_some());
+        assert!(ctrl.proposal_delay(2).is_none());
         assert!(ctrl.vote_delay(1).is_some());
         // 200 s: phase 2 targets 2 only.
         let ctrl = controller_at(Duration::from_secs(200), ProtocolSection::Autobahn);
-        assert!(ctrl.proposal_fault(3).is_none());
+        assert!(ctrl.proposal_delay(3).is_none());
         assert!(ctrl.vote_delay(1).is_none());
         assert_eq!(
-            ctrl.proposal_fault(2).map(|f| f.delay),
+            ctrl.proposal_delay(2),
             Some(FaultDelay::RelativeToTimeout { offset_ms: -100 })
         );
     }
@@ -687,7 +552,7 @@ mod tests {
     #[test]
     fn disabled_controller_has_no_faults() {
         let ctrl = FaultController::disabled();
-        assert!(ctrl.proposal_fault(0).is_none());
+        assert!(ctrl.proposal_delay(0).is_none());
         assert!(ctrl.vote_delay(0).is_none());
     }
 
@@ -720,23 +585,40 @@ mod tests {
     }
 
     #[test]
-    fn autobahn_only_fields_are_rejected_for_hotstuff() {
-        let vote = spec_with(
-            "hotstuff",
-            "<voteDelay><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></voteDelay>",
-        );
-        assert!(FaultController::load(&vote, 0, ProtocolSection::Hotstuff).is_err());
-        let msgs = spec_with(
-            "hotstuff",
+    fn vote_delay_is_rejected_for_hotstuff() {
+        let body = "<voteDelay><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></voteDelay>";
+        assert!(FaultController::load(&spec_with("hotstuff", body), 0, ProtocolSection::Hotstuff).is_err());
+        assert!(FaultController::load(&spec_with("autobahn", body), 0, ProtocolSection::Autobahn).is_ok());
+    }
+
+    #[test]
+    fn removed_forms_are_rejected() {
+        for body in [
             "<proposalDelay><messages>prepare</messages><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
-        );
-        assert!(FaultController::load(&msgs, 0, ProtocolSection::Hotstuff).is_err());
-        // The same body is fine under the autobahn section.
-        let ok = spec_with(
-            "autobahn",
-            "<proposalDelay><messages>prepare</messages><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
-        );
-        assert!(FaultController::load(&ok, 0, ProtocolSection::Autobahn).is_ok());
+            "<proposalDelay><forceSlowPath>true</forceSlowPath><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
+            "<proposalDelay><delayMs>300</delayMs><replicas><id>1</id></replicas></proposalDelay>",
+        ] {
+            let err = FaultController::load(&spec_with("autobahn", body), 0, ProtocolSection::Autobahn).unwrap_err();
+            assert!(format!("{:#}", err).contains("unknown field"), "{:#}", err);
+        }
+    }
+
+    #[test]
+    fn phase_start_must_be_given_once() {
+        let phase = |start: &str| {
+            format!(
+                r#"<failureSpec><phases><phase>{}<autobahn></autobahn></phase></phases></failureSpec>"#,
+                start
+            )
+        };
+        assert!(FaultController::load(&phase("<atTimeMs>1500</atTimeMs>"), 0, ProtocolSection::Autobahn).is_ok());
+        for start in ["", "<time>60</time>", "<startAt>60</startAt>", "<atTime>1</atTime><atTimeMs>1000</atTimeMs>"] {
+            assert!(
+                FaultController::load(&phase(start), 0, ProtocolSection::Autobahn).is_err(),
+                "{:?} should be rejected",
+                start
+            );
+        }
     }
 
     #[test]
@@ -751,11 +633,6 @@ mod tests {
             "<proposalDelay><replicas><replica><id>1</id><delayMs>1</delayMs><delayRelativeToTimeoutMs>-1</delayRelativeToTimeoutMs></replica></replicas></proposalDelay>",
         );
         assert!(FaultController::load(&both, 0, ProtocolSection::Autobahn).is_err());
-        let bad_msgs = spec_with(
-            "autobahn",
-            "<proposalDelay><messages>prepare,vote</messages><replicas><replica><id>1</id><delayMs>1</delayMs></replica></replicas></proposalDelay>",
-        );
-        assert!(FaultController::load(&bad_msgs, 0, ProtocolSection::Autobahn).is_err());
     }
 
     #[test]
@@ -765,8 +642,8 @@ mod tests {
             "<proposalDelay><replicas><replica><id>1</id><delayMs>300</delayMs></replica></replicas></proposalDelay>",
         );
         let hotstuff = FaultController::load(&xml, 0, ProtocolSection::Hotstuff).unwrap();
-        assert!(hotstuff.proposal_fault(1).is_none());
+        assert!(hotstuff.proposal_delay(1).is_none());
         let autobahn = FaultController::load(&xml, 0, ProtocolSection::Autobahn).unwrap();
-        assert!(autobahn.proposal_fault(1).is_some());
+        assert!(autobahn.proposal_delay(1).is_some());
     }
 }
