@@ -3,7 +3,7 @@ mod node;
 
 use crate::config::Export as _;
 use crate::config::{Committee, Secret};
-use crate::node::{AdaptiveOptions, LearningOptions, Node, ProtocolKind};
+use crate::node::{AdaptiveOptions, LearningOptions, Node};
 use clap::{crate_name, crate_version, App, AppSettings, SubCommand};
 use hotstuff::Committee as ConsensusCommittee;
 use env_logger::Env;
@@ -31,7 +31,6 @@ async fn main() {
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
-                .args_from_usage("--protocol=[NAME] 'Consensus protocol: hotstuff (default hotstuff)'")
                 .args_from_usage("--replica-id=[INT] 'Global 0-based id of this replica (default 0)'")
                 .args_from_usage("--replica-map=[FILE] 'replica_map.json mapping public keys to replica ids'")
                 .args_from_usage("--failure-spec=[FILE] 'failure_spec.xml for proposal-delay injection'")
@@ -82,14 +81,7 @@ async fn main() {
                     return;
                 }
             };
-            let protocol = match ProtocolKind::parse(subm.value_of("protocol").unwrap_or("hotstuff")) {
-                Ok(protocol) => protocol,
-                Err(e) => {
-                    error!("{}", e);
-                    return;
-                }
-            };
-            match Node::new(protocol, committee_file, key_file, store_path, parameters_file, adaptive_opts).await {
+            match Node::new(committee_file, key_file, store_path, parameters_file, adaptive_opts).await {
                 Ok(mut node) => {
                     tokio::spawn(async move {
                         node.analyze_block().await;
@@ -195,7 +187,7 @@ fn deploy_testbed(nodes: usize) -> Result<Vec<JoinHandle<()>>, Box<dyn std::erro
             let _ = fs::remove_dir_all(&store_path);
 
             Ok(tokio::spawn(async move {
-                match Node::new(ProtocolKind::Hotstuff, committee_file, &key_file, &store_path, None, AdaptiveOptions::default()).await {
+                match Node::new(committee_file, &key_file, &store_path, None, AdaptiveOptions::default()).await {
                     // Process committed blocks (acks client transactions).
                     Ok(mut node) => node.analyze_block().await,
                     Err(e) => error!("{}", e),

@@ -50,19 +50,18 @@ pub struct Instrumentation {
     /// global id).
     pub faults: Arc<FaultController>,
     pub replica_id: u32,
-    pub replica_of: HashMap<PublicKey, u32>,
 }
 
+#[cfg(test)]
 impl Instrumentation {
-    /// No learning, no failure injection; the timeout cell is fixed at
-    /// `timeout_delay_ms`. Used by tests and non-adaptive runs.
+    /// For tests: no learning, no failure injection, and the timeout fixed at
+    /// `timeout_delay_ms`.
     pub fn disabled(timeout_delay_ms: u64) -> Self {
         Self {
             timeout_cell: TimeoutCell::new(std::time::Duration::from_millis(timeout_delay_ms)),
             learning: None,
             faults: Arc::new(FaultController::disabled()),
             replica_id: 0,
-            replica_of: HashMap::new(),
         }
     }
 }
@@ -225,12 +224,6 @@ impl Core {
         while let Some(block) = to_commit.pop_back() {
             if !block.payload.is_empty() {
                 info!("Committed {}", block);
-
-                #[cfg(feature = "benchmark")]
-                for x in &block.payload {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Committed B{}({})", block.round, base64::encode(x));
-                }
             }
             debug!("Committed {:?}", block);
             self.commits_since_last_timeout += 1;
@@ -435,12 +428,6 @@ impl Core {
         .await;
         if !block.payload.is_empty() {
             info!("Created {}", block);
-
-            #[cfg(feature = "benchmark")]
-            for x in &block.payload {
-                // NOTE: This log entry is used to compute performance.
-                info!("Created B{}({})", block.round, base64::encode(x));
-            }
         }
         debug!("Created {:?}", block);
 

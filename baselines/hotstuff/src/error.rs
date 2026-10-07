@@ -59,7 +59,4 @@ pub enum ConsensusError {
         leader: PublicKey,
         round: RoundNumber,
     },
-
-    #[error("Invalid payload")]
-    InvalidPayload,
 }

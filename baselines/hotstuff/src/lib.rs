@@ -18,5 +18,4 @@ pub use crate::config::{Committee, Parameters};
 pub use crate::consensus::Consensus;
 pub use crate::core::{CommittedBlock, ConsensusMessage, Instrumentation, RoundNumber};
 pub use crate::error::ConsensusError;
-pub use crate::mempool::MempoolDriver;
 pub use crate::messages::{Block, QC, TC};

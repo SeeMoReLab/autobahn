@@ -29,7 +29,7 @@ pub enum NetworkError {
 /// Delivery class of an outbound message.
 ///
 /// `Control` carries the small messages consensus liveness depends on
-/// (pre-prepares, votes, view changes, sync requests/replies): they queue
+/// (proposals, votes, timeouts, sync requests/replies): they queue
 /// unbounded per peer and are never dropped locally, so a congested link
 /// costs latency, not stalled sequences. `Bulk` carries large redundant
 /// traffic - sealed payload broadcasts - on a bounded, age-limited queue:
@@ -39,7 +39,7 @@ pub enum NetworkError {
 /// Rationale (CloudLab run 20260906_130402): with a single shared bounded
 /// queue, a network-delay transition briefly congested the leader's links,
 /// payload floods filled the per-peer queues, and dropped votes and
-/// pre-prepares halved the commit cadence for as long as the backlog fed
+/// proposals halved the commit cadence for as long as the backlog fed
 /// itself - a degraded state the election timer cannot see, because
 /// deliveries keep trickling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

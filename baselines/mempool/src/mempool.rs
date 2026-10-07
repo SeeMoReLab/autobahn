@@ -31,7 +31,7 @@ impl Mempool {
         ack_index: Arc<AckIndex>,
         ack_router: Arc<AckRouter>,
     ) -> MempoolResult<()> {
-        // NOTE: The following log entries are used to compute performance.
+        // Print the mempool parameters at boot.
         info!(
             "Mempool queued transactions bound set to {}",
             parameters.max_queued_transactions

@@ -42,20 +42,6 @@ pub enum NodeError {
     AdaptiveError(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProtocolKind {
-    Hotstuff,
-}
-
-impl ProtocolKind {
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
-            "hotstuff" => Ok(Self::Hotstuff),
-            other => Err(format!("unknown protocol {:?}; expected hotstuff", other)),
-        }
-    }
-}
-
 /// Learning-loop settings (all durations in milliseconds). The initial
 /// timeout is `parameters.consensus.timeout_delay`.
 #[derive(Clone, Debug)]
@@ -105,7 +91,6 @@ pub struct Node {
 
 impl Node {
     pub async fn new(
-        protocol: ProtocolKind,
         committee_file: &str,
         key_file: &str,
         store_path: &str,
@@ -128,7 +113,7 @@ impl Node {
         let ack_index = Arc::new(AckIndex::new(ACK_INDEX_CAPACITY));
         let ack_router = Arc::new(AckRouter::new());
 
-        // Adaptive-timer wiring shared by both protocols.
+        // Adaptive-timer wiring.
         let replica_of: HashMap<PublicKey, u32> = match &adaptive_opts.replica_map {
             Some(path) => {
                 let data = std::fs::read(path).map_err(|e| NodeError::ReadError {
@@ -142,9 +127,6 @@ impl Node {
             }
             None => HashMap::new(),
         };
-        let failure_section = match protocol {
-            ProtocolKind::Hotstuff => ProtocolSection::Hotstuff,
-        };
         let faults = match (&adaptive_opts.failure_spec, adaptive_opts.failure_start_unix_ms)
         {
             (Some(spec), Some(start_ms)) => {
@@ -154,7 +136,7 @@ impl Node {
                     ));
                 }
                 Arc::new(
-                    FaultController::load_file(spec, start_ms, failure_section)
+                    FaultController::load_file(spec, start_ms, ProtocolSection::Hotstuff)
                         .map_err(|e| NodeError::AdaptiveError(format!("{:#}", e)))?,
                 )
             }
@@ -190,61 +172,55 @@ impl Node {
 
         let (tx_delivered, rx_delivered) = channel::<Delivered>(1000);
 
-        let learning = match protocol {
-            ProtocolKind::Hotstuff => {
-                let committee = Committee::read(committee_file)?;
-                let parameters = match parameters {
-                    Some(filename) => Parameters::read(filename)?,
-                    None => Parameters::default(),
-                };
-                let timeout_cell = TimeoutCell::new(Duration::from_millis(
-                    parameters.consensus.timeout_delay,
-                ));
-                let learning = make_learning(hotstuff_hooks(timeout_cell.clone()))?;
-                let instrumentation = hotstuff::Instrumentation {
-                    timeout_cell,
-                    learning: learning.clone(),
-                    faults,
-                    replica_id: adaptive_opts.replica_id,
-                    replica_of: replica_of.clone(),
-                };
-
-                let (tx_commit, rx_commit) = channel(1000);
-                let (tx_consensus, rx_consensus) = channel(1000);
-                let (tx_consensus_mempool, rx_consensus_mempool) = channel(1000);
-                let (tx_mempool_loopback, rx_mempool_loopback) = channel(1000);
-
-                Mempool::run(
-                    name,
-                    committee.mempool,
-                    parameters.mempool,
-                    store.clone(),
-                    signature_service.clone(),
-                    tx_mempool_loopback,
-                    rx_consensus_mempool,
-                    Arc::clone(&ack_index),
-                    Arc::clone(&ack_router),
-                )?;
-
-                hotstuff::Consensus::run(
-                    name,
-                    committee.consensus,
-                    parameters.consensus,
-                    store.clone(),
-                    signature_service,
-                    tx_consensus,
-                    rx_consensus,
-                    tx_consensus_mempool,
-                    rx_mempool_loopback,
-                    tx_commit,
-                    instrumentation,
-                )
-                .await?;
-
-                Self::adapt_hotstuff_commits(rx_commit, tx_delivered);
-                learning
-            }
+        let committee = Committee::read(committee_file)?;
+        let parameters = match parameters {
+            Some(filename) => Parameters::read(filename)?,
+            None => Parameters::default(),
         };
+        let timeout_cell = TimeoutCell::new(Duration::from_millis(
+            parameters.consensus.timeout_delay,
+        ));
+        let learning = make_learning(hotstuff_hooks(timeout_cell.clone()))?;
+        let instrumentation = hotstuff::Instrumentation {
+            timeout_cell,
+            learning: learning.clone(),
+            faults,
+            replica_id: adaptive_opts.replica_id,
+        };
+
+        let (tx_commit, rx_commit) = channel(1000);
+        let (tx_consensus, rx_consensus) = channel(1000);
+        let (tx_consensus_mempool, rx_consensus_mempool) = channel(1000);
+        let (tx_mempool_loopback, rx_mempool_loopback) = channel(1000);
+
+        Mempool::run(
+            name,
+            committee.mempool,
+            parameters.mempool,
+            store.clone(),
+            signature_service.clone(),
+            tx_mempool_loopback,
+            rx_consensus_mempool,
+            Arc::clone(&ack_index),
+            Arc::clone(&ack_router),
+        )?;
+
+        hotstuff::Consensus::run(
+            name,
+            committee.consensus,
+            parameters.consensus,
+            store.clone(),
+            signature_service,
+            tx_consensus,
+            rx_consensus,
+            tx_consensus_mempool,
+            rx_mempool_loopback,
+            tx_commit,
+            instrumentation,
+        )
+        .await?;
+
+        Self::adapt_hotstuff_commits(rx_commit, tx_delivered);
 
         info!("Node {} successfully booted", name);
         Ok(Self {
