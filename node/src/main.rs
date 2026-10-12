@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
                 .args_from_usage("--failure-start-unix-ms=[INT] 'Shared injection start timestamp (epoch ms)'")
                 .args_from_usage("--learning 'Enable the learning-agent episode loop'")
                 .args_from_usage("--agent-target=[ADDR] 'Learning agent host:port (default 127.0.0.1:15501)'")
+                .args_from_usage("--learning-anchor-unix-ms=[INT] 'Shared apply instant of episode 1 (epoch ms); required with --learning'")
                 .args_from_usage("--learning-feature-duration=[INT] 'Feature window ms (default 10000)'")
                 .args_from_usage("--learning-reply-wait=[INT] 'Recommendation wait ms (default 2000)'")
                 .args_from_usage("--learning-warmup-duration=[INT] 'Post-apply warm-up ms (default 3000)'")
@@ -188,12 +189,15 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             };
             let learning = if matches.is_present("learning") {
                 anyhow::ensure!(!replica_of.is_empty(), "--learning requires --replica-map");
+                let anchor_unix_ms = parse_u64("learning-anchor-unix-ms")?
+                    .context("--learning requires --learning-anchor-unix-ms")?;
                 let mut cfg = LearningConfig::new(
                     replica_id,
                     matches
                         .value_of("agent-target")
                         .unwrap_or("127.0.0.1:15501")
                         .to_string(),
+                    anchor_unix_ms,
                 );
                 cfg.feature_duration =
                     Duration::from_millis(parse_u64("learning-feature-duration")?.unwrap_or(10_000));

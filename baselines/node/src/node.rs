@@ -47,6 +47,8 @@ pub enum NodeError {
 #[derive(Clone, Debug)]
 pub struct LearningOptions {
     pub agent_target: String,
+    /// Shared apply instant of episode 1 (epoch ms).
+    pub anchor_unix_ms: u64,
     pub feature_duration_ms: u64,
     pub reply_wait_ms: u64,
     pub warmup_duration_ms: u64,
@@ -156,8 +158,11 @@ impl Node {
                             "--learning requires --replica-map".into(),
                         ));
                     }
-                    let mut cfg =
-                        LearningConfig::new(adaptive_opts.replica_id, opts.agent_target.clone());
+                    let mut cfg = LearningConfig::new(
+                        adaptive_opts.replica_id,
+                        opts.agent_target.clone(),
+                        opts.anchor_unix_ms,
+                    );
                     cfg.feature_duration = Duration::from_millis(opts.feature_duration_ms);
                     cfg.reply_wait = Duration::from_millis(opts.reply_wait_ms);
                     cfg.warmup_duration = Duration::from_millis(opts.warmup_duration_ms);

@@ -15,6 +15,38 @@ enum Protocol {
     PROTOCOL_SMARTBFT = 7;
 }
 
+// Conventions shared by every *Report message below.
+// - Units: latency, inter-commit gap and phase fields are float milliseconds.
+//   Batch fields are float items per committed batch or block (requests,
+//   except on Autobahn); throughput_tps is items per second.
+// - Every consensus-latency, inter-commit-gap, batch-size and phase family
+//   carries avg, p50, p90 and p95. Percentiles are nearest rank over the
+//   window's samples: the ascending-sorted sample at index ceil(p*n)-1, and 0
+//   with no samples. Below 20 samples p90 and p95 coincide.
+// - Inter-commit gaps reset at every window: n commits in a window give n-1
+//   gaps, so a window with 0 or 1 commits reports 0 for every gap statistic.
+// - Phase families: the unprefixed phase field (e.g. prepare_latency_ms) is
+//   the window mean; the p50_/p90_/p95_ prefixed fields are its percentiles.
+//   Phase samples of 0 ms or more are kept, so a sub-millisecond phase counts.
+// - Empty window: the engines report 0 when nothing committed; the learning
+//   agent then sets all four consensus-latency statistics to the window
+//   length. Gap, batch and phase statistics stay 0.
+// - A field name means the same statistic in every message, but numbers are
+//   per message. The statistics added for uniformity share one block from 30
+//   up (39 is free); a message skips a number whose name it already carries
+//   under an older number.
+// - Same name, different measurement (documented, not unified):
+//   - Consensus latency is one sample per batch, dated from the oldest request
+//     in it, on CppBedrock (PBFT, SBFT); one sample per request, from its
+//     arrival at this replica, on SmartBFT; one sample per height, from
+//     round-0 enterPropose to commit, on Tendermint; one sample per block
+//     (HotStuff) or header (Autobahn), from this replica's first sight of it.
+//   - Tendermint excludes empty blocks from the batch statistics but counts
+//     them in total_consensus_instances.
+//   - Autobahn batch, total_transactions and throughput fields count
+//     worker-batch digests, not requests.
+//   - SBFT phases are not PBFT phases (see SbftReport).
+
 // PBFT state report, shared by CppBedrock PBFT/LinearPBFT.
 message PbftReport {
     // Workload size in the learning window.
@@ -45,18 +77,32 @@ message PbftReport {
     uint32 view_change_count = 15;
     uint32 no_progress_view_change_count = 16;
 
-    // Phase-wise latency (milliseconds), reported by CppBedrock PBFT:
-    // pre-prepare arrival -> prepare quorum, prepare quorum -> commit quorum,
-    // commit quorum -> local execution. Zero when the engine does not
-    // measure them (SmartBFT-shaped consumers ignore these fields).
+    // Phase-wise latency window means (milliseconds), reported by CppBedrock
+    // PBFT: pre-prepare arrival -> prepare quorum, prepare quorum -> commit
+    // quorum, commit quorum -> local execution.
     float pre_prepare_latency_ms = 17;
     float prepare_latency_ms = 18;
     float commit_latency_ms = 19;
+
+    // Percentiles completing the avg/p50/p90/p95 families.
+    float p90_consensus_latency_ms = 30;
+    float p90_inter_commit_gap_ms = 34;
+    float p50_batch_size = 36;
+    float p90_batch_size = 37;
+    float p50_pre_prepare_latency_ms = 40;
+    float p90_pre_prepare_latency_ms = 41;
+    float p95_pre_prepare_latency_ms = 42;
+    float p50_prepare_latency_ms = 43;
+    float p90_prepare_latency_ms = 44;
+    float p95_prepare_latency_ms = 45;
+    float p50_commit_latency_ms = 46;
+    float p90_commit_latency_ms = 47;
+    float p95_commit_latency_ms = 48;
 }
 
-// SBFT state report (CppBedrock SBFT). Fields 1-16 have the same layout and
-// semantics as PbftReport so tooling can treat the two uniformly; the
-// remaining fields carry the SBFT-specific phase and fast/slow-path context.
+// SBFT state report (CppBedrock SBFT). Fields 1-19 and 30-48 have the same
+// layout as PbftReport so tooling can treat the two uniformly; fields 20-25
+// carry the SBFT-specific fast/slow-path context.
 message SbftReport {
     uint32 total_transactions = 1;
     uint32 total_consensus_instances = 2;
@@ -76,8 +122,10 @@ message SbftReport {
     uint32 view_change_count = 15;
     uint32 no_progress_view_change_count = 16;
 
-    // Phase-wise latency (milliseconds): pre-prepare arrival -> prepare
-    // quorum, prepare quorum -> commit quorum, commit quorum -> execution.
+    // Phase-wise latency window means (milliseconds). The names follow PBFT
+    // but the phases differ: pre-prepare arrival -> certificate, certificate
+    // -> execute certificate (about 0 on the fast path), and the rest to
+    // local execution.
     float pre_prepare_latency_ms = 17;
     float prepare_latency_ms = 18;
     float commit_latency_ms = 19;
@@ -96,6 +144,21 @@ message SbftReport {
     float nth_prepare_gap_ms = 23;
     uint32 nth_prepare_seen_count = 24;
     uint32 nth_prepare_unseen_count = 25;
+
+    // Percentiles completing the avg/p50/p90/p95 families.
+    float p90_consensus_latency_ms = 30;
+    float p90_inter_commit_gap_ms = 34;
+    float p50_batch_size = 36;
+    float p90_batch_size = 37;
+    float p50_pre_prepare_latency_ms = 40;
+    float p90_pre_prepare_latency_ms = 41;
+    float p95_pre_prepare_latency_ms = 42;
+    float p50_prepare_latency_ms = 43;
+    float p90_prepare_latency_ms = 44;
+    float p95_prepare_latency_ms = 45;
+    float p50_commit_latency_ms = 46;
+    float p90_commit_latency_ms = 47;
+    float p95_commit_latency_ms = 48;
 }
 
 message TendermintReport {
@@ -121,10 +184,34 @@ message TendermintReport {
     uint32 leader_change_count = 10;
     uint32 regency_change_count = 11;
 
-    // Phase-wise latency
+    // Phase-wise latency window means (milliseconds), round 0 only except
+    // that a height committing in a later round adds those rounds to
+    // precommit: propose -> prevote, prevote -> precommit, precommit -> commit.
     float propose_latency_ms = 12;
     float prevote_latency_ms = 13;
     float precommit_latency_ms = 14;
+
+    // Percentiles and the inter-commit gap family completing the
+    // avg/p50/p90/p95 families.
+    float p95_consensus_latency_ms = 31;
+    float avg_inter_commit_gap_ms = 32;
+    float p50_inter_commit_gap_ms = 33;
+    float p90_inter_commit_gap_ms = 34;
+    float p95_inter_commit_gap_ms = 35;
+    float p95_batch_size = 38;
+    float p50_propose_latency_ms = 40;
+    float p90_propose_latency_ms = 41;
+    float p95_propose_latency_ms = 42;
+    float p50_prevote_latency_ms = 43;
+    float p90_prevote_latency_ms = 44;
+    float p95_prevote_latency_ms = 45;
+    float p50_precommit_latency_ms = 46;
+    float p90_precommit_latency_ms = 47;
+    float p95_precommit_latency_ms = 48;
+
+    // The propose timeout in force for this window. Tendermint has no
+    // view-change counters: a round change is not an election.
+    uint32 timeout_ms = 49;
 }
 
 // Batched (chained 2-chain) HotStuff state report. Field layout mirrors
@@ -137,6 +224,7 @@ message TendermintReport {
 // - leader_change_count follows the committed blocks' authors; HotStuff
 //   rotates leaders every round, so this tracks commit cadence, not
 //   elections.
+// HotStuff has no phase fields.
 message HotstuffReport {
     uint32 total_transactions = 1;
     uint32 total_consensus_instances = 2;
@@ -154,6 +242,12 @@ message HotstuffReport {
     float p95_inter_commit_gap_ms = 14;
     uint32 view_change_count = 15;
     uint32 no_progress_view_change_count = 16;
+
+    // Percentiles completing the avg/p50/p90/p95 families.
+    float p90_consensus_latency_ms = 30;
+    float p90_inter_commit_gap_ms = 34;
+    float p50_batch_size = 36;
+    float p90_batch_size = 37;
 }
 
 // Autobahn state report. Same layout and semantics as HotstuffReport, with
@@ -179,11 +273,18 @@ message AutobahnReport {
     float p95_inter_commit_gap_ms = 14;
     uint32 view_change_count = 15;
     uint32 no_progress_view_change_count = 16;
+
+    // Percentiles completing the avg/p50/p90/p95 families.
+    float p90_consensus_latency_ms = 30;
+    float p90_inter_commit_gap_ms = 34;
+    float p50_batch_size = 36;
+    float p90_batch_size = 37;
 }
 
 // SmartBFT state report. Same layout and semantics as PbftReport. SmartBFT is
 // registered as its own protocol so its reward function and schedule can be
-// tuned independently of the Rust PBFT baseline.
+// tuned independently of the Rust PBFT baseline. The engine leaves
+// no_progress_view_change_count at 0.
 message SmartbftReport {
     uint32 total_transactions = 1;
     uint32 total_consensus_instances = 2;
@@ -201,6 +302,16 @@ message SmartbftReport {
     float p95_inter_commit_gap_ms = 14;
     uint32 view_change_count = 15;
     uint32 no_progress_view_change_count = 16;
+
+    // Held for phase fields with PbftReport's layout; SmartBFT exports no
+    // phase stamps yet.
+    reserved 17 to 19, 40 to 48;
+
+    // Percentiles completing the avg/p50/p90/p95 families.
+    float p90_consensus_latency_ms = 30;
+    float p90_inter_commit_gap_ms = 34;
+    float p50_batch_size = 36;
+    float p90_batch_size = 37;
 }
 
 // One report from a local node for one episode.

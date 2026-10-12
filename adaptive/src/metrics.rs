@@ -197,6 +197,7 @@ mod tests {
         let values: Vec<Duration> = (1..=10).map(Duration::from_millis).collect();
         // Go: index = ceil(p * n) - 1.
         assert_eq!(percentile_duration_ms(&values, 0.50), 5.0);
+        assert_eq!(percentile_duration_ms(&values, 0.90), 9.0);
         assert_eq!(percentile_duration_ms(&values, 0.95), 10.0);
         assert_eq!(percentile_duration_ms(&values, 0.99), 10.0);
         assert_eq!(percentile_duration_ms(&values[..1], 0.95), 1.0);

@@ -37,6 +37,7 @@ async fn main() {
                 .args_from_usage("--failure-start-unix-ms=[INT] 'Shared injection start timestamp (epoch ms)'")
                 .args_from_usage("--learning 'Enable the learning-agent episode loop'")
                 .args_from_usage("--agent-target=[ADDR] 'Learning agent host:port (default 127.0.0.1:15501)'")
+                .args_from_usage("--learning-anchor-unix-ms=[INT] 'Shared apply instant of episode 1 (epoch ms); required with --learning'")
                 .args_from_usage("--learning-feature-duration=[INT] 'Feature window ms (default 10000)'")
                 .args_from_usage("--learning-reply-wait=[INT] 'Recommendation wait ms (default 2000)'")
                 .args_from_usage("--learning-warmup-duration=[INT] 'Post-apply warm-up ms (default 3000)'")
@@ -78,7 +79,7 @@ async fn main() {
                 Ok(opts) => opts,
                 Err(e) => {
                     error!("{}", e);
-                    return;
+                    std::process::exit(1);
                 }
             };
             match Node::new(committee_file, key_file, store_path, parameters_file, adaptive_opts).await {
@@ -121,6 +122,8 @@ fn parse_adaptive_options(subm: &clap::ArgMatches<'_>) -> Result<AdaptiveOptions
                 .value_of("agent-target")
                 .unwrap_or("127.0.0.1:15501")
                 .to_string(),
+            anchor_unix_ms: parse_u64("learning-anchor-unix-ms")?
+                .ok_or("--learning requires --learning-anchor-unix-ms")?,
             feature_duration_ms: parse_u64("learning-feature-duration")?.unwrap_or(10_000),
             reply_wait_ms: parse_u64("learning-reply-wait")?.unwrap_or(2_000),
             warmup_duration_ms: parse_u64("learning-warmup-duration")?.unwrap_or(3_000),

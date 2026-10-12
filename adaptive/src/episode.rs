@@ -5,6 +5,12 @@
 //! the recommendation, discard `warmup_duration`, measure the reward for
 //! `reward_duration`, then start the next episode.
 //!
+//! Episodes sit on a grid shared by every replica: episode e (e >= 1) applies
+//! its recommendation at `anchor_unix_ms + period * (e - 1)` and starts
+//! `feature_duration + reply_wait` earlier, where the period is the sum of the
+//! four stage durations. The loop starts with the manager and joins at the
+//! first episode whose start is still ahead.
+//!
 //! The consensus-count window mode is intentionally not implemented yet; the
 //! CloudLab harness drives the wall-clock mode.
 
@@ -13,9 +19,9 @@ use crate::metrics::{LearningSample, LearningWindowMetrics, WindowSnapshot};
 use crate::pb;
 use crate::saturating_u32;
 use crate::timestamped_log_tag;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,6 +29,9 @@ pub const DEFAULT_FEATURE_DURATION: Duration = Duration::from_secs(10);
 pub const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(2);
 pub const DEFAULT_WARMUP_DURATION: Duration = Duration::from_secs(3);
 pub const DEFAULT_REWARD_DURATION: Duration = Duration::from_secs(5);
+/// How late an episode may begin before it is skipped. The previous episode's
+/// reward end is the next start, so a zero tolerance would skip every episode.
+const EPISODE_OVERRUN_TOLERANCE: Duration = Duration::from_secs(1);
 
 macro_rules! learning_println {
     ($($arg:tt)*) => {
@@ -34,6 +43,9 @@ macro_rules! learning_println {
 pub struct LearningConfig {
     pub node_id: u32,
     pub agent_target: String,
+    /// Wall-clock apply instant of episode 1 (benchmark start plus the failure
+    /// spec's warm-up), the same on every replica.
+    pub anchor_unix_ms: u64,
     pub poll_interval: Duration,
     pub rpc_timeout: Duration,
     pub feature_duration: Duration,
@@ -43,10 +55,11 @@ pub struct LearningConfig {
 }
 
 impl LearningConfig {
-    pub fn new(node_id: u32, agent_target: String) -> Self {
+    pub fn new(node_id: u32, agent_target: String, anchor_unix_ms: u64) -> Self {
         Self {
             node_id,
             agent_target,
+            anchor_unix_ms,
             poll_interval: DEFAULT_POLL_INTERVAL,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             feature_duration: DEFAULT_FEATURE_DURATION,
@@ -186,8 +199,53 @@ struct Inner {
     poller_decision: Option<pb::timeout::Value>,
 
     pending_reward: Option<(u32, WindowSnapshot, pb::timeout::Value)>,
+}
 
-    driver_spawned: bool,
+/// The shared episode grid, converted to the monotonic clock once.
+#[derive(Clone, Copy, Debug)]
+struct Grid {
+    anchor_unix_ms: u64,
+    period: Duration,
+    apply_offset: Duration,
+    first_episode: u32,
+    first_start: Instant,
+}
+
+impl Grid {
+    fn start(&self, episode: u32) -> Instant {
+        self.first_start + self.period * (episode - self.first_episode)
+    }
+
+    fn apply_unix_ms(&self, episode: u32) -> u64 {
+        self.anchor_unix_ms + self.period.as_millis() as u64 * (episode as u64 - 1)
+    }
+}
+
+/// The smallest episode e >= 1 whose start, `anchor + period * (e - 1) -
+/// apply_offset`, is not before `now_unix`, and how far ahead of now it is.
+fn first_grid_episode(
+    anchor_unix_ms: u64,
+    period: Duration,
+    apply_offset: Duration,
+    now_unix: Duration,
+) -> Result<(u32, Duration)> {
+    let period_ns = period.as_nanos() as i128;
+    let first_start_ns = anchor_unix_ms as i128 * 1_000_000 - apply_offset.as_nanos() as i128;
+    let behind_ns = now_unix.as_nanos() as i128 - first_start_ns;
+    let skipped = if behind_ns <= 0 {
+        0
+    } else {
+        (behind_ns + period_ns - 1) / period_ns
+    };
+    let episode = u32::try_from(1 + skipped).context("learning anchor is too far in the past")?;
+    let ahead_ns = first_start_ns + skipped * period_ns - now_unix.as_nanos() as i128;
+    Ok((episode, Duration::from_nanos(ahead_ns as u64)))
+}
+
+fn unix_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
 }
 
 pub struct LearningManager {
@@ -196,13 +254,29 @@ pub struct LearningManager {
     client: AgentClient,
     inner: Mutex<Inner>,
     handle: tokio::runtime::Handle,
+    grid: Grid,
 }
 
 impl LearningManager {
-    /// Create the manager. Must be called from within a tokio runtime; the
-    /// episode driver and pollers are spawned on it when the first consensus
-    /// sample arrives.
+    /// Create the manager and start the episode driver. Must be called from
+    /// within a tokio runtime; the driver and pollers are spawned on it.
     pub fn new(cfg: LearningConfig, hooks: ProtocolHooks) -> Result<Arc<Self>> {
+        let period =
+            cfg.feature_duration + cfg.reply_wait + cfg.warmup_duration + cfg.reward_duration;
+        if period.is_zero() {
+            bail!("learning episode period must be positive");
+        }
+        let apply_offset = cfg.feature_duration + cfg.reply_wait;
+        let now_instant = Instant::now();
+        let (first_episode, ahead) =
+            first_grid_episode(cfg.anchor_unix_ms, period, apply_offset, unix_now())?;
+        let grid = Grid {
+            anchor_unix_ms: cfg.anchor_unix_ms,
+            period,
+            apply_offset,
+            first_episode,
+            first_start: now_instant + ahead,
+        };
         let client = AgentClient::connect_lazy(&cfg.agent_target, cfg.rpc_timeout, hooks.protocol)?;
         let initial = hooks.initial_timeout.clone();
         learning_println!(
@@ -221,12 +295,20 @@ impl LearningManager {
             cfg.warmup_duration,
             cfg.reward_duration
         );
-        Ok(Arc::new(Self {
+        learning_println!(
+            "wall-clock grid: anchor_unix_ms={} period_ms={} apply_offset_ms={} first_episode={} first_start_unix_ms={}",
+            grid.anchor_unix_ms,
+            grid.period.as_millis(),
+            grid.apply_offset.as_millis(),
+            grid.first_episode,
+            grid.apply_unix_ms(grid.first_episode) - grid.apply_offset.as_millis() as u64
+        );
+        let manager = Arc::new(Self {
             cfg,
             hooks,
             client,
             inner: Mutex::new(Inner {
-                current_episode: 1,
+                current_episode: 0,
                 episode_start_tick: 0,
                 delivered_count: 0,
                 last_sequence: 0,
@@ -239,35 +321,22 @@ impl LearningManager {
                 poller_episode: 0,
                 poller_decision: None,
                 pending_reward: None,
-                driver_spawned: false,
             }),
             handle: tokio::runtime::Handle::current(),
-        }))
+            grid,
+        });
+        let driver = Arc::clone(&manager);
+        manager.handle.spawn(async move {
+            driver.run_wall_clock().await;
+        });
+        Ok(manager)
     }
 
-    /// Record one delivered consensus instance. Starts the wall-clock episode
-    /// loop on the first sample.
+    /// Record one delivered consensus instance.
     pub fn record_consensus(self: &Arc<Self>, sample: LearningSample) {
         let mut inner = self.inner.lock().unwrap();
         inner.delivered_count += 1;
         inner.last_sequence = sample.sequence;
-
-        if inner.stage == Stage::Idle && !inner.driver_spawned {
-            let start_tick = sample.sequence.saturating_sub(1);
-            inner.episode_start_tick = start_tick;
-            inner.stage = Stage::Feature;
-            let start = sample.decision_time;
-            inner.stage_deadline = Some(start + self.cfg.feature_duration);
-            inner.metrics.reset_with_throughput_start(start);
-            inner.metrics.timeout =
-                Duration::from_millis((self.hooks.timeout_ms)(&inner.current_timeout) as u64);
-            inner.driver_spawned = true;
-            let manager = Arc::clone(self);
-            let episode = inner.current_episode;
-            self.handle.spawn(async move {
-                manager.run_wall_clock(episode, start).await;
-            });
-        }
 
         let in_measured_stage = matches!(inner.stage, Stage::Feature | Stage::Reward);
         let before_deadline = inner
@@ -293,8 +362,31 @@ impl LearningManager {
         }
     }
 
-    async fn run_wall_clock(self: Arc<Self>, mut episode: u32, mut episode_start: Instant) {
+    async fn run_wall_clock(self: Arc<Self>) {
+        let mut episode = self.grid.first_episode;
         loop {
+            let mut episode_start = self.grid.start(episode);
+            let now = Instant::now();
+            // Overrun: the episode's start is past by more than the tolerance,
+            // so join the next episode whose start is still ahead.
+            if now > episode_start + EPISODE_OVERRUN_TOLERANCE {
+                let behind_ns = (now - episode_start).as_nanos();
+                let period_ns = self.grid.period.as_nanos();
+                let skip = ((behind_ns + period_ns - 1) / period_ns) as u32;
+                learning_println!(
+                    "WARNING: episode {} start overran by {} ms; skipping to episode {}",
+                    episode,
+                    (now - episode_start).as_millis(),
+                    episode + skip
+                );
+                episode += skip;
+                episode_start = self.grid.start(episode);
+            }
+            if Instant::now() < episode_start {
+                tokio::time::sleep_until(episode_start.into()).await;
+            }
+            self.begin_episode(episode, episode_start);
+
             let feature_end = episode_start + self.cfg.feature_duration;
             tokio::time::sleep_until(feature_end.into()).await;
             if !self.handle_feature_deadline(episode, feature_end) {
@@ -320,8 +412,20 @@ impl LearningManager {
             }
 
             episode += 1;
-            episode_start = reward_end;
         }
+    }
+
+    fn begin_episode(&self, episode: u32, start: Instant) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.current_episode = episode;
+        inner.episode_start_tick = inner.last_sequence;
+        inner.metrics.reset_with_throughput_start(start);
+        inner.metrics.timeout =
+            Duration::from_millis((self.hooks.timeout_ms)(&inner.current_timeout) as u64);
+        inner.stage = Stage::Feature;
+        inner.stage_deadline = Some(start + self.cfg.feature_duration);
+        inner.poller_decision = None;
+        inner.poller_episode = 0;
     }
 
     fn handle_feature_deadline(self: &Arc<Self>, episode: u32, deadline: Instant) -> bool {
@@ -404,6 +508,7 @@ impl LearningManager {
         inner.poller_decision = None;
 
         let mut applied = false;
+        let apply_unix_ms = unix_now().as_millis() as i64;
         if let Some(value) = decision {
             match (self.hooks.apply_timeout)(&value) {
                 Ok(()) => {
@@ -427,17 +532,23 @@ impl LearningManager {
         let current_ms = (self.hooks.timeout_ms)(&inner.current_timeout);
         drop(inner);
 
+        let grid_apply_unix_ms = self.grid.apply_unix_ms(episode);
+        let lag_ms = apply_unix_ms - grid_apply_unix_ms as i64;
         if applied {
             learning_println!(
-                "applied wall-clock recommendation: episode={} timeout_ms={}",
+                "applied wall-clock recommendation: episode={} timeout_ms={} grid_apply_unix_ms={} lag_ms={}",
                 episode,
-                current_ms
+                current_ms,
+                grid_apply_unix_ms,
+                lag_ms
             );
         } else {
             learning_println!(
-                "wall-clock reply deadline reached without recommendation update: episode={} timeout_ms={}",
+                "wall-clock reply deadline reached without recommendation update: episode={} timeout_ms={} grid_apply_unix_ms={} lag_ms={}",
                 episode,
-                current_ms
+                current_ms,
+                grid_apply_unix_ms,
+                lag_ms
             );
         }
         true
@@ -484,16 +595,9 @@ impl LearningManager {
         );
         inner.pending_reward = Some((episode, snapshot, used));
 
-        // Start the next episode.
-        inner.current_episode += 1;
-        inner.episode_start_tick = inner.last_sequence;
-        inner.metrics.reset_with_throughput_start(end);
-        inner.metrics.timeout =
-            Duration::from_millis((self.hooks.timeout_ms)(&inner.current_timeout) as u64);
-        inner.stage = Stage::Feature;
-        inner.stage_deadline = Some(end + self.cfg.feature_duration);
-        inner.poller_decision = None;
-        inner.poller_episode = 0;
+        // The driver starts the next episode on the grid.
+        inner.stage = Stage::Idle;
+        inner.stage_deadline = None;
         true
     }
 
@@ -563,6 +667,26 @@ impl LearningManager {
 mod tests {
     use super::*;
     use crate::timeouts::TimeoutCell;
+
+    #[test]
+    fn first_grid_episode_joins_the_next_start() {
+        let period = Duration::from_secs(20);
+        let offset = Duration::from_secs(12);
+        // Episode 1 starts at 100 s - 12 s = 88 s.
+        let (episode, ahead) =
+            first_grid_episode(100_000, period, offset, Duration::from_secs(80)).unwrap();
+        assert_eq!((episode, ahead), (1, Duration::from_secs(8)));
+        let (episode, ahead) =
+            first_grid_episode(100_000, period, offset, Duration::from_secs(88)).unwrap();
+        assert_eq!((episode, ahead), (1, Duration::ZERO));
+        // A late joiner takes the next grid slot, numbered as everyone else.
+        let (episode, ahead) =
+            first_grid_episode(100_000, period, offset, Duration::from_millis(88_001)).unwrap();
+        assert_eq!((episode, ahead), (2, Duration::from_millis(19_999)));
+        let (episode, ahead) =
+            first_grid_episode(100_000, period, offset, Duration::from_secs(150)).unwrap();
+        assert_eq!((episode, ahead), (5, Duration::from_secs(18)));
+    }
 
     #[test]
     fn hotstuff_hooks_roundtrip() {
